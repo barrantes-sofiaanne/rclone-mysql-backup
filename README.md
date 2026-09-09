@@ -83,8 +83,9 @@ reproducible digest of the backup contents — never a random value.
 
 After `rclone sync`, the container verifies the remote destination reports the
 same **file count** and **total bytes** as the local backup directory (via
-`rclone lsf --recursive -l`). This confirms the objects are present and are not
-missing/truncated.
+`rclone size --json`, which returns the authoritative remote object count and
+total byte size as JSON: `{"count":N,"bytes":M,"sizeless":K}`). This confirms
+the objects are present and are not missing/truncated.
 
 This is **not** claimed to be full cryptographic verification of the remote
 copy: rclone's R2 listing does not expose a trustworthy remote SHA-256 of every
