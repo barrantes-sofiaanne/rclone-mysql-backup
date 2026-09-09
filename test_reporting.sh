@@ -19,6 +19,9 @@
 #   - rclone upload failure attempts a failed report
 #   - successful backup + failed report exits 3 (backup NOT marked failed)
 #   - missing BACKUP_REPORT_TOKEN is never echoed
+#   - verify_upload() parses `rclone size --json` (count/bytes) and fails on
+#     count mismatch / byte mismatch / malformed JSON / rclone failure
+#   - verify_upload() always passes --config "$RCLONE_CONFIG"
 #
 # NOTE: This runs the helper functions in-process by sourcing entrypoint.sh.
 # The top-level "Main" section only runs when the script is executed, so we
@@ -247,9 +250,12 @@ cat > "$FLOW_DIR/rclone" <<'STUB'
 #!/usr/bin/env bash
 # Fake rclone. Tolerates a leading "--config <path>" argument (the entrypoint
 # always passes one). `sync` "succeeds" (exit 0) unless RCLONE_EXIT is non-zero.
-# `lsf -l` mimics the R2 listing by reading the LOCAL backup dir, printing
-# "<size> <relative/path>" lines exactly like `rclone lsf -l` would after a
-# successful sync (used by verify_upload for presence/size verification).
+# `size --json` mimics `rclone size --json`:
+#   - honours RCLONE_SIZE_EXIT (command-failure simulation),
+#   - honours SIZE_JSON (explicit controlled output for mismatch/malformed
+#     tests),
+#   - otherwise prints the real object count/bytes of the LOCAL backup dir
+#     (so the full main() smoke test's verify_upload sees matching values).
 # `listremotes` prints the configured remote name.
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -257,11 +263,22 @@ while [[ $# -gt 0 ]]; do
     config) exit 0;;
     listremotes) printf 'remote:\n'; exit 0;;
     sync) exit "${RCLONE_EXIT:-0}";;
-    lsf)
+    size)
+      if [[ "${RCLONE_SIZE_EXIT:-0}" != "0" ]]; then
+        exit "${RCLONE_SIZE_EXIT}"
+      fi
+      if [[ -n "${SIZE_JSON:-}" ]]; then
+        printf '%s\n' "$SIZE_JSON"
+        exit 0
+      fi
       base="backup"
       [[ -d "$base" ]] || base="$(pwd)/backup"
       if [[ -d "$base" ]]; then
-        (cd "$base" && find . -type f -printf "%s %P\n" 2>/dev/null | sort)
+        cnt="$( (cd "$base" && find . -type f 2>/dev/null | wc -l) )"
+        byt="$( (cd "$base" && find . -type f -printf "%s\n" 2>/dev/null | awk '{s+=$1} END {print s+0}') )"
+        printf '{"count":%s,"bytes":%s,"sizeless":0}\n' "$cnt" "$byt"
+      else
+        printf '{"count":0,"bytes":0,"sizeless":0}\n'
       fi
       exit 0;;
     *) exit 0;;
@@ -414,7 +431,7 @@ for a in "$@"; do
 done
 case "${1:-}" in
   listremotes) printf 'remote:\n'; exit 0;;
-  lsf) exit 0;;
+  size) printf '{"count":0,"bytes":0,"sizeless":0}\n'; exit 0;;
   sync) exit 0;;
   *) exit 0;;
 esac
@@ -432,7 +449,7 @@ printf '[remote]\ntype = s3\n' > "$RCLONE_CONFIG"
   source "$ENTRYPOINT" >/dev/null 2>&1
   rclone --config "$RCLONE_CONFIG" listremotes >/dev/null 2>&1
   rclone --config "$RCLONE_CONFIG" sync backup remote:b/x >/dev/null 2>&1
-  rclone --config "$RCLONE_CONFIG" lsf --recursive -l remote:b/x >/dev/null 2>&1
+  rclone --config "$RCLONE_CONFIG" size --json remote:b/x >/dev/null 2>&1
 ) || true
 if [[ -f "$RCLONE_CONFIG_USED" && "$(cat "$RCLONE_CONFIG_USED")" == "$RCLONE_CONFIG" ]]; then
   pass "rclone invoked with explicit --config path"
@@ -497,6 +514,110 @@ else
 fi
 # And no backup dir should have been produced (job failed before mydumper).
 if [[ -d "$FLOW_DIR/backup" ]]; then fail "no backup dir should be created when reporting config missing"; else pass "no backup dir created when reporting config missing"; fi
+
+# ---------------------------------------------------------------------------
+# verify_upload() parses `rclone size --json` (authoritative remote count +
+# bytes). It must fail on count mismatch, byte mismatch, malformed JSON, and
+# rclone failure, and must always pass --config "$RCLONE_CONFIG".
+# ---------------------------------------------------------------------------
+echo "== verify_upload (rclone size --json) =="
+
+VU_DIR="$(mktemp -d)"
+export VU_DIR
+# Local backup dir used as the source of truth: 2 files, 7 bytes.
+mkdir -p "$VU_DIR/backup/sub"
+printf 'hello' > "$VU_DIR/backup/a.sql"       # 5 bytes
+printf 'xy'   > "$VU_DIR/backup/sub/b.sql"     # 2 bytes
+BACKUP_DIR="$VU_DIR/backup"
+R2_BUCKET="vu-bucket"
+RCLONE_CONFIG="$VU_DIR/rclone.conf"
+RCLONE_CONFIG_DIR="$VU_DIR"
+printf '[remote]\ntype = s3\n' > "$RCLONE_CONFIG"
+STORAGE_PATH="mysql-backup/daily_snapshot/2026/09/10/daily_snapshot_2026-09-10_020000"
+
+cat > "$VU_DIR/rclone" <<'STUB'
+#!/usr/bin/env bash
+# Record the --config argument actually passed, then dispatch on the rclone
+# subcommand. The entrypoint always invokes: rclone --config <path> size ...
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --config)
+      printf '%s' "$2" > "$VU_DIR/config_used"
+      shift 2;;
+    size)
+      if [[ "${VU_RCLONE_EXIT:-0}" != "0" ]]; then
+        echo "boom" >&2
+        exit "${VU_RCLONE_EXIT}"
+      fi
+      printf '%s\n' "${VU_SIZE_JSON:-}"
+      exit 0;;
+    *) shift;;
+  esac
+done
+exit 0
+STUB
+chmod +x "$VU_DIR/rclone"
+
+VU_OLD_PATH="$PATH"
+export PATH="$VU_DIR:$PATH"
+export RCLONE_CONFIG VU_RCLONE_EXIT VU_SIZE_JSON
+
+# Local source-of-truth values.
+VU_LOCAL_COUNT="$(count_files)"   # 2
+VU_LOCAL_BYTES="$(total_size)"    # 7
+
+# 1) Matching count + bytes -> success.
+export VU_RCLONE_EXIT=0
+export VU_SIZE_JSON='{"count":2,"bytes":7,"sizeless":0}'
+if verify_upload >"$VU_DIR/out" 2>&1; then pass "verify_upload succeeds on matching count+bytes"; else fail "verify_upload should succeed on matching count+bytes"; fi
+assert_contains "success logs count+bytes" "$(cat "$VU_DIR/out")" "2 file(s), 7 bytes"
+
+# 2) Count mismatch -> failure.
+export VU_SIZE_JSON='{"count":3,"bytes":7,"sizeless":0}'
+if verify_upload >"$VU_DIR/out" 2>&1; then fail "verify_upload should fail on count mismatch"; else pass "verify_upload fails on count mismatch"; fi
+assert_contains "count mismatch warns expected" "$(cat "$VU_DIR/out")" "expected 2 file(s), found 3"
+
+# 3) Byte mismatch -> failure.
+export VU_SIZE_JSON='{"count":2,"bytes":8,"sizeless":0}'
+if verify_upload >"$VU_DIR/out" 2>&1; then fail "verify_upload should fail on byte mismatch"; else pass "verify_upload fails on byte mismatch"; fi
+assert_contains "byte mismatch warns expected" "$(cat "$VU_DIR/out")" "expected 7 bytes, found 8"
+
+# 4) Malformed JSON -> failure.
+export VU_SIZE_JSON='not-json-at-all'
+if verify_upload >"$VU_DIR/out" 2>&1; then fail "verify_upload should fail on malformed JSON"; else pass "verify_upload fails on malformed JSON"; fi
+assert_contains "malformed json warns could not read" "$(cat "$VU_DIR/out")" "could not read the remote size"
+
+# 5) Empty JSON (rclone produced nothing) -> failure.
+export VU_SIZE_JSON=''
+if verify_upload >"$VU_DIR/out" 2>&1; then fail "verify_upload should fail on empty output"; else pass "verify_upload fails on empty output"; fi
+
+# 6) rclone size command failure -> failure.
+export VU_SIZE_JSON='{"count":2,"bytes":7,"sizeless":0}'
+export VU_RCLONE_EXIT=1
+if verify_upload >"$VU_DIR/out" 2>&1; then fail "verify_upload should fail when rclone size fails"; else pass "verify_upload fails when rclone size command fails"; fi
+assert_contains "rclone failure warns could not read" "$(cat "$VU_DIR/out")" "could not read the remote size"
+
+# 7) Correct --config argument is always used.
+export VU_RCLONE_EXIT=0
+export VU_SIZE_JSON='{"count":2,"bytes":7,"sizeless":0}'
+verify_upload >/dev/null 2>&1 || true
+if [[ -f "$VU_DIR/config_used" && "$(cat "$VU_DIR/config_used")" == "$RCLONE_CONFIG" ]]; then
+  pass "verify_upload passes --config \$RCLONE_CONFIG to rclone size"
+else
+  fail "verify_upload did not pass --config \$RCLONE_CONFIG to rclone size"
+fi
+
+# No secret material is ever logged by verify_upload.
+export VU_SIZE_JSON='{"count":2,"bytes":7,"sizeless":0}'
+verify_upload >"$VU_DIR/out" 2>&1 || true
+export VU_SIZE_JSON='not-json'
+verify_upload >>"$VU_DIR/out" 2>&1 || true
+assert_not_contains "verify_upload never logs token" "$(cat "$VU_DIR/out")" "super-secret-report-token"
+assert_not_contains "verify_upload never logs r2 secret" "$(cat "$VU_DIR/out")" "r2super-secret-key"
+
+export PATH="$VU_OLD_PATH"
+rm -rf "$VU_DIR"
+unset VU_DIR VU_RCLONE_EXIT VU_SIZE_JSON RCLONE_CONFIG RCLONE_CONFIG_DIR
 
 # ---------------------------------------------------------------------------
 # Tool presence check (check_tools)
