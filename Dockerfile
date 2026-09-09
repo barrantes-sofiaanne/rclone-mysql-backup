@@ -9,27 +9,47 @@ FROM mydumper/mydumper:v0.21.3-2
 
 COPY --from=rclone /usr/local/bin/rclone /usr/local/bin/rclone
 
-# Add the runtime utilities needed by the reporting/hardening steps that are
-# not guaranteed in the AlmaLinux-9-based mydumper image: curl (HTTP client),
-# ca-certificates (TLS), coreutils (sha256sum/date/sort/wc/head/tr/mktemp),
-# findutils (find), grep, sed, and gawk. Use dnf/yum/microdnf (the correct
-# manager for this RHEL-family base).
+# Install ONLY the runtime commands the entrypoint needs that are not already
+# present in the AlmaLinux-9-based mydumper image.
+#
+# The base image already ships curl-minimal and coreutils-single, which provide
+# the `curl` command and the coreutils commands (date/sha256sum/sort/wc/head/
+# tr/mktemp). Requesting the full `curl` or `coreutils` packages would CONFLICT
+# with those variants. Installing by absolute binary path (/usr/bin/curl, ...)
+# makes dnf resolve to whatever package already provides the file (the minimal/
+# single variant) and does nothing when the command already exists, so we never
+# force a package replacement.
+#
+# Required commands: curl date find sha256sum sed awk grep sort wc head mktemp tr
+#   - /usr/bin/curl      -> curl-minimal (already present) or curl
+#   - /usr/bin/find      -> findutils
+#   - /usr/bin/sha256sum,/usr/bin/date,/usr/bin/sort,/usr/bin/wc,/usr/bin/head,
+#     /usr/bin/tr,/usr/bin/mktemp -> coreutils-single (already present)
+#   - /usr/bin/sed,/usr/bin/awk,/usr/bin/grep -> sed, gawk, grep
+#   - ca-certificates    -> TLS trust store for HTTPS reporting
 RUN set -eux; \
-    if command -v dnf >/dev/null 2>&1; then \
-      dnf -y install \
-         curl ca-certificates coreutils findutils grep sed gawk \
-      && dnf clean all; \
-    elif command -v yum >/dev/null 2>&1; then \
-      yum -y install \
-         curl ca-certificates coreutils findutils grep sed gawk \
-      && yum clean all; \
-    elif command -v microdnf >/dev/null 2>&1; then \
-      microdnf -y install \
-         curl ca-certificates coreutils findutils grep sed gawk \
-      && microdnf clean all; \
+    PKG="dnf"; \
+    if command -v microdnf >/dev/null 2>&1; then PKG="microdnf"; \
+    elif command -v dnf >/dev/null 2>&1; then PKG="dnf"; \
+    elif command -v yum >/dev/null 2>&1; then PKG="yum"; \
+    else echo "No package manager (dnf/yum/microdnf) found." >&2; exit 1; fi; \
+    \
+    # Build an install list of absolute paths ONLY for commands that are missing.
+    install_list=""; \
+    for cmd in /usr/bin/curl /usr/bin/find /usr/bin/sha256sum /usr/bin/date \
+               /usr/bin/sort /usr/bin/wc /usr/bin/head /usr/bin/tr \
+               /usr/bin/mktemp /usr/bin/sed /usr/bin/awk /usr/bin/grep; do \
+      if [ ! -e "$cmd" ]; then install_list="$install_list $cmd"; fi; \
+    done; \
+    # ca-certificates is only needed when curl is being added or TLS is absent.
+    if ! rpm -q ca-certificates >/dev/null 2>&1; then \
+      install_list="$install_list ca-certificates"; \
+    fi; \
+    if [ -n "$install_list" ]; then \
+      "$PKG" -y install $install_list; \
+      "$PKG" clean all; \
     else \
-      echo "No supported package manager (dnf/yum/microdnf) found in the mydumper base image." >&2; \
-      exit 1; \
+      echo "All required runtime commands are already present in the base image."; \
     fi
 
 COPY entrypoint.sh /entrypoint.sh
