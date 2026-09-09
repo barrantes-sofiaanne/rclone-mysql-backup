@@ -17,6 +17,44 @@
 set -euo pipefail
 
 # ---------------------------------------------------------------------------
+# Runtime diagnostics (non-secret)
+# ---------------------------------------------------------------------------
+# CURRENT_STAGE is updated before every major operation and reported by the
+# EXIT/ERR traps so a runtime failure is immediately locatable in the logs.
+CURRENT_STAGE="startup"
+
+set_stage() {
+  CURRENT_STAGE="$1"
+}
+
+# Report the current stage + the shell's exit status on exit. Never prints
+# secrets (it only reports the numeric status and the stage label).
+report_exit() {
+  local status=$?
+  if [[ -n "${CURRENT_STAGE:-}" ]]; then
+    echo "[backup] EXIT: stage=${CURRENT_STAGE}, status=${status}" >&2
+  else
+    echo "[backup] EXIT: status=${status}" >&2
+  fi
+}
+
+# Report a runtime error with stage + line + exit status + safe command
+# context. The command text is truncated and never includes secrets (the
+# BASH_COMMAND of a failing credential-bearing invocation is not echoed; we
+# only report the numeric status and the stage/line).
+report_err() {
+  local status=$?
+  echo "[backup][error] stage=${CURRENT_STAGE:-?}, line=${BASH_LINENO[0]:-?}, status=${status}" >&2
+}
+
+# Only install the traps when the script is run directly (not when sourced by
+# tests). Sourcing must not hijack the sourcing shell's EXIT/ERR traps.
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+  trap report_exit EXIT
+  trap report_err ERR
+fi
+
+# ---------------------------------------------------------------------------
 # Configuration / environment
 # ---------------------------------------------------------------------------
 # Values are read here as plain assignments (no hard failure at load time) so
@@ -55,6 +93,7 @@ BACKUP_DIR="backup"
 # rclone's own home resolution, which can differ in minimal containers).
 # HOME may be unset or resolve differently inside the container, so default to
 # /root when unset and always mkdir -p the directory before writing.
+set_stage "load_config"
 if [[ -z "${HOME:-}" ]]; then
   export HOME="/root"
 fi
@@ -64,6 +103,7 @@ export RCLONE_CONFIG
 # env var is also honoured by rclone).
 RCLONE_CONFIG_DIR="$(dirname "$RCLONE_CONFIG")"
 export RCLONE_CONFIG_DIR
+set_stage "loaded_config"
 
 # ---------------------------------------------------------------------------
 # State for reporting (set as the run progresses)
@@ -364,10 +404,19 @@ main() {
   # BACKUP_REPORT_URL and BACKUP_REPORT_TOKEN are REQUIRED. validate_env() has
   # already exited non-zero if either is missing, so reporting is always enabled
   # by the time we reach this point.
+  set_stage "validate_env"
+  log "Stage: validate_env"
   validate_env
+  log "Stage: validate_env -> OK"
+
+  set_stage "check_tools"
+  log "Stage: check_tools"
   check_tools
+  log "Stage: check_tools -> OK"
+
   REPORTING_ENABLED=1
 
+  set_stage "init"
   STARTED_AT="$(now_utc)"
   BACKUP_NAME="daily_snapshot_$(date -u +"%Y-%m-%d_%H%M%S")"
 
@@ -379,8 +428,9 @@ main() {
   log "R2 destination: ${R2_BUCKET}/${STORAGE_PATH}"
 
   # 1) Logical dump with mydumper into a fresh local directory.
+  set_stage "mydumper"
+  log "Stage: mydumper (started)"
   rm -rf "$BACKUP_DIR"
-  log "MyDumper started..."
   if ! mydumper \
     --host "$MYSQL_HOST" \
     --user "$MYSQL_USER" \
@@ -390,13 +440,14 @@ main() {
     -C -c --clear -o "$BACKUP_DIR"; then
     report_failure_and_exit "mydumper failed to produce a logical database snapshot."
   fi
-  log "MyDumper completed."
+  log "Stage: mydumper -> OK"
 
+  set_stage "metadata"
+  log "Stage: metadata (started)"
   if [[ ! -d "$BACKUP_DIR" ]]; then
     report_failure_and_exit "mydumper exited successfully but produced no backup directory."
   fi
 
-  # 2) Metadata (must be computed before upload so failures can be reported).
   FILE_COUNT="$(count_files)"
   BACKUP_SIZE="$(total_size)"
   if [[ "$FILE_COUNT" -eq 0 ]]; then
@@ -409,12 +460,14 @@ main() {
   log "Backup metadata calculated."
   log "Backup files: ${FILE_COUNT}, total bytes: ${BACKUP_SIZE}"
   log "Backup checksum (SHA-256): ${CHECKSUM}"
+  log "Stage: metadata -> OK"
 
   # 3) Configure rclone (existing behavior preserved, hardened):
   #    - mkdir -p the config directory FIRST so the write can never fail.
   #    - write an explicit, deterministic config file.
   #    - validate it by listing remotes with --config before uploading.
-  log "Preparing rclone configuration at ${RCLONE_CONFIG} ..."
+  set_stage "rclone_config"
+  log "Stage: rclone_config (started) -> ${RCLONE_CONFIG}"
   mkdir -p "$RCLONE_CONFIG_DIR"
   cat > "$RCLONE_CONFIG" <<EOF
 [remote]
@@ -425,7 +478,7 @@ secret_access_key = $R2_SECRET_ACCESS_KEY
 endpoint = $R2_ENDPOINT
 acl = private
 EOF
-  log "rclone configuration written."
+  log "Stage: rclone_config -> written"
 
   # Validate the config parses and exposes the [remote] before we attempt an
   # upload. Fail fast with a clear (non-secret) diagnostic if it does not.
@@ -435,28 +488,31 @@ EOF
   if ! rclone --config "$RCLONE_CONFIG" listremotes 2>/dev/null | grep -q '^remote:$'; then
     report_failure_and_exit "rclone configuration is missing the [remote] destination."
   fi
-  log "rclone configuration validated ([remote] present)."
+  log "Stage: rclone_config -> validated ([remote] present)"
 
   # 4) Upload to the unique destination.
-  log "R2 upload started -> remote:${R2_BUCKET}/${STORAGE_PATH}"
+  set_stage "rclone_upload"
+  log "Stage: rclone_upload (started) -> remote:${R2_BUCKET}/${STORAGE_PATH}"
   if ! rclone --config "$RCLONE_CONFIG" sync "$BACKUP_DIR" "remote:${R2_BUCKET}/${STORAGE_PATH}"; then
     report_failure_and_exit "rclone upload to Cloudflare R2 failed."
   fi
-  log "R2 upload completed."
+  log "Stage: rclone_upload -> OK"
 
   # 5) Verify the upload (do not report success on local success alone).
-  log "R2 verification started..."
+  set_stage "rclone_verify"
+  log "Stage: rclone_verify (started)"
   if ! verify_upload; then
     report_failure_and_exit "R2 upload verification failed."
   fi
-  log "R2 verification completed."
+  log "Stage: rclone_verify -> OK"
 
   COMPLETED_AT="$(now_utc)"
 
   log "Backup uploaded and verified successfully: ${BACKUP_NAME}"
 
   # 6) Report success.
-  log "Reporting success to PUPTracker..."
+  set_stage "report_success"
+  log "Stage: report_success (started)"
   if ! report_now "success"; then
     # The backup itself succeeded and is safe in R2. Only the report failed.
     # Do NOT change the backup's status to failed. Log clearly and exit
@@ -465,7 +521,9 @@ EOF
     warn "Backup succeeded but PUPTracker reporting failed."
     exit 3
   fi
+  log "Stage: report_success -> OK"
 
+  set_stage "done"
   log "Backup completed and reported to PUPTracker."
   exit 0
 }
