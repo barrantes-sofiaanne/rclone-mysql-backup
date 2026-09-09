@@ -328,10 +328,11 @@ compute_manifest_checksum() {
 # object count and TOTAL BYTES against what rclone reports at the destination.
 #
 # Scope / honesty:
-#   - rclone's `lsf -l` returns remote file sizes for the S3/R2 backend but
-#     does NOT expose a cryptographically trustworthy remote hash of every
-#     object without an extra HEAD/GET round trip (R2 does not surface the same
-#     ETag guarantees as other S3 providers for multipart uploads).
+#   - `rclone size --json` returns the authoritative remote object count and
+#     total bytes for the S3/R2 backend, but it does NOT expose a
+#     cryptographically trustworthy remote hash of every object without an
+#     extra HEAD/GET round trip (R2 does not surface the same ETag guarantees
+#     as other S3 providers for multipart uploads).
 #   - This check therefore verifies OBJECT PRESENCE + COUNT + TOTAL SIZE
 #     (i.e. nothing is missing or truncated), NOT full cryptographic
 #     verification of the remote copy.
@@ -345,20 +346,27 @@ verify_upload() {
   local remote_count
   local local_bytes
   local remote_bytes
-  local listing
+  local size_json
 
   local_count="$(count_files)"
   local_bytes="$(total_size)"
 
-  # lsf -l prints "<size> <path>" lines. Capture the raw listing once. The
-  # --config flag guarantees rclone reads OUR config regardless of HOME.
-  listing="$(rclone --config "$RCLONE_CONFIG" lsf --recursive -l "remote:${R2_BUCKET}/${STORAGE_PATH}" 2>/dev/null || true)"
+  # Ask rclone for the authoritative remote object count + total bytes as a
+  # single line of JSON: {"count":N,"bytes":M,"sizeless":K}. The --config flag
+  # guarantees rclone reads OUR config regardless of HOME. If the command
+  # fails, capture nothing (the empty result is treated as an unparseable/
+  # failed verification below rather than a silent success).
+  size_json="$(rclone --config "$RCLONE_CONFIG" size --json "remote:${R2_BUCKET}/${STORAGE_PATH}" 2>/dev/null || true)"
 
-  remote_count="$(printf '%s\n' "$listing" | sed '/^[[:space:]]*$/d' | wc -l)"
-  remote_bytes="$(printf '%s\n' "$listing" | awk '{ s += $1 } END { print s+0 }')"
+  # Parse the JSON with sed (not human-readable output). On a well-formed
+  # single-line object these extract the numeric fields; on malformed or empty
+  # input the extraction is empty, which fails the checks below.
+  remote_count="$(printf '%s' "$size_json" | sed -n 's/.*"count":\([0-9][0-9]*\).*/\1/p')"
+  remote_bytes="$(printf '%s' "$size_json" | sed -n 's/.*"bytes":\([0-9][0-9]*\).*/\1/p')"
 
-  if [[ -z "$remote_bytes" || -z "$remote_count" ]]; then
-    warn "R2 presence/size verification could not read the remote listing at remote:${R2_BUCKET}/${STORAGE_PATH}."
+  # Fail if the JSON could not be parsed or rclone size did not succeed.
+  if [[ -z "$remote_count" || -z "$remote_bytes" ]]; then
+    warn "R2 presence/size verification could not read the remote size at remote:${R2_BUCKET}/${STORAGE_PATH}."
     return 1
   fi
 
