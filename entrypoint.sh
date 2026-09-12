@@ -47,9 +47,17 @@ report_err() {
   echo "[backup][error] stage=${CURRENT_STAGE:-?}, line=${BASH_LINENO[0]:-?}, status=${status}" >&2
 }
 
-# Only install the traps when the script is run directly (not when sourced by
-# tests). Sourcing must not hijack the sourcing shell's EXIT/ERR traps.
-if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+# Install the traps only when the script is actually being RUN (not when it is
+# sourced for function-level testing). Sourcing must not hijack the sourcing
+# shell's EXIT/ERR traps.
+#
+# NOTE: BASH_SOURCE[0] == $0 is NOT a sufficient test on its own. The common
+# test idiom `bash -c 'source "$0" ...' /entrypoint.sh` ALSO makes them equal
+# (because $0 is set to the file being sourced), which would make the guard at
+# the bottom of this file invoke main() inside the test subprocess. Setting
+# BACKUP_SOURCED=1 in the environment explicitly opts out of running main().
+BACKUP_SOURCED="${BACKUP_SOURCED:-0}"
+if [[ "${BASH_SOURCE[0]}" == "$0" && "$BACKUP_SOURCED" != "1" ]]; then
   trap report_exit EXIT
   trap report_err ERR
 fi
@@ -71,6 +79,13 @@ R2_SECRET_ACCESS_KEY="${R2_SECRET_ACCESS_KEY:-}"
 R2_ENDPOINT="${R2_ENDPOINT:-}"
 R2_BUCKET="${R2_BUCKET:-}"
 R2_PATH="${R2_PATH:-mysql-backup}"
+# S3 provider/ACL presented to rclone. The defaults target Cloudflare R2. They
+# are overridable so the SAME image can be validated against an S3-compatible
+# endpoint (e.g. MinIO in the integration harness) or pointed at another
+# provider without patching the script. Set R2_ACL="" to omit the acl option
+# entirely (some S3-compatible servers reject canned ACLs).
+R2_PROVIDER="${R2_PROVIDER:-Cloudflare}"
+R2_ACL="${R2_ACL-private}"
 
 # PUPTracker reporting (REQUIRED). The job fails fast (non-zero, no backup) in
 # validate_env() if either variable is missing — we never run a backup that
@@ -83,8 +98,125 @@ BACKUP_REPORT_TOKEN="${BACKUP_REPORT_TOKEN:-}"
 # Seconds to wait for the HTTP report call (kept short; no aggressive retries).
 REPORT_TIMEOUT="${REPORT_TIMEOUT:-20}"
 
-# Where mydumper writes locally.
+# ---------------------------------------------------------------------------
+# Exit codes (documented so operators/orchestrators can react correctly)
+# ---------------------------------------------------------------------------
+#   0 = the whole chain succeeded (backup + upload + verify + report + state)
+#   1 = a general failure (configuration, tooling, dump, upload, verification,
+#       STATE PERSISTENCE, ...)
+#   3 = the backup succeeded but the PUPTracker success report failed
+#   4 = PUPTracker returned 409: an integrity conflict with an existing,
+#       differently-check-summed backup of the same name
+#   5 = another backup run currently holds the distributed lock
+EXIT_GENERAL_FAILURE=1
+EXIT_REPORT_FAILED=3
+EXIT_REPORT_CONFLICT=4
+EXIT_LOCK_HELD=5
+
+# ---------------------------------------------------------------------------
+# Backup policy (full / incremental)
+# ---------------------------------------------------------------------------
+# A FULL logical backup is taken when the most recent SUCCESSFUL, VERIFIED full
+# backup is >= BACKUP_FULL_INTERVAL_DAYS old (or when none exists). Every other
+# run is a TRUE binary-log incremental. A full-backup day NEVER also runs an
+# incremental (there is no code path that does both in one run).
+BACKUP_FULL_INTERVAL_DAYS="${BACKUP_FULL_INTERVAL_DAYS:-14}"
+
+# Binary-log (TRUE incremental) support. When BACKUP_BINLOG_ENABLED=false a FULL
+# backup is still possible, but a run that REQUIRES an incremental will fail
+# safely rather than fabricate one.
+BACKUP_BINLOG_ENABLED="${BACKUP_BINLOG_ENABLED:-true}"
+# When true, REQUIRE log_bin=ON (and a usable binlog_format) before any
+# incremental. When false the probe is skipped and incrementals are refused.
+BACKUP_BINLOG_VERIFY="${BACKUP_BINLOG_VERIFY:-true}"
+
+# Optional display/log timezone. All timestamps remain stored in UTC.
+BACKUP_TIMEZONE="${BACKUP_TIMEZONE:-UTC}"
+
+# ---------------------------------------------------------------------------
+# mysqlbinlog replication consumer identity
+# ---------------------------------------------------------------------------
+# mysqlbinlog --read-from-remote-server and --raw make this process act as a
+# replication CLIENT, which REQUIRES a server_id that is unique among every
+# other replication consumer/binlog reader on the server. Hard-coding 1 is
+# dangerous: it can collide with a real replica, with Railway's own binlog
+# archiving, or with a concurrent backup, and a duplicate server_id makes the
+# server disconnect/terminate the older connection (silently truncating THIS
+# backup's capture).
+#
+# Default 2147483000 sits near the top of the MySQL server_id range
+# (1..4294967295) to minimise collision odds for a dedicated backup consumer.
+# Override MYSQLBINLOG_SERVER_ID per deployment so every consumer is distinct.
+MYSQLBINLOG_SERVER_ID="${MYSQLBINLOG_SERVER_ID:-2147483000}"
+
+# ---------------------------------------------------------------------------
+# Concurrency protection (distributed lock in object storage)
+# ---------------------------------------------------------------------------
+# The backup chain state lives in R2, so a container-local flock cannot prevent
+# two SCHEDULED container runs from overlapping. We therefore take a distributed
+# lock as an object in R2 next to the state object. It is created when absent
+# (rclone copyto does not overwrite an existing object), carries an expiry
+# timestamp, and is removed on exit. An expired lock is treated as stale and is
+# taken over, so a crash can NEVER permanently block future backups.
+BACKUP_LOCK_ENABLED="${BACKUP_LOCK_ENABLED:-true}"
+BACKUP_LOCK_TTL_SECONDS="${BACKUP_LOCK_TTL_SECONDS:-21600}"  # 6h
+BACKUP_LOCK_REMOTE="${R2_PATH%/}/state/backup.lock"
+BACKUP_LOCK_HELD=0
+BACKUP_LOCK_TOKEN=""
+
+# ---------------------------------------------------------------------------
+# Binlog fetch strategy
+# ---------------------------------------------------------------------------
+# `raw`  (DEFAULT): pull an exact byte copy with
+#          `mysqlbinlog --read-from-remote-server --raw`.
+#          This is the standard, supported mechanism for a remote binlog
+#          consumer. The MySQL user needs the REPLICATION SLAVE privilege
+#          (read-only; it does not entitle the account to modify data).
+# `copy`: read the binlog files directly off the filesystem, for deployments
+#          where the server's binlog directory is mounted into this container
+#          (e.g. a shared volume). Requires BINLOG_LOCAL_DIR.
+#
+# Whichever strategy is used, the captured package is ALWAYS re-read locally
+# with mysqlbinlog before upload, so a truncated or unreadable capture can never
+# be uploaded as if it were a valid incremental.
+BINLOG_FETCH_STRATEGY="${BINLOG_FETCH_STRATEGY:-raw}"
+# Directory containing the server's binlog files, required by the `copy`
+# strategy only. Example: /var/lib/mysql
+BINLOG_LOCAL_DIR="${BINLOG_LOCAL_DIR:-}"
+
+# ---------------------------------------------------------------------------
+# Clock overrides (test seams)
+# ---------------------------------------------------------------------------
+# now_utc()/now_epoch()/ts_to_epoch() may be pre-defined by a sourcing test
+# harness to pin time. The defaults below are only installed when nothing else
+# has defined them, so production behaviour is unchanged.
+if ! declare -F now_utc >/dev/null 2>&1; then
+  # An ISO-8601 UTC timestamp (second precision). GNU date is assumed.
+  now_utc() { date -u +"%Y-%m-%dT%H:%M:%SZ"; }
+fi
+if ! declare -F now_epoch >/dev/null 2>&1; then
+  now_epoch() { date -u +%s; }
+fi
+if ! declare -F ts_to_epoch >/dev/null 2>&1; then
+  ts_to_epoch() { date -u -d "$1" +%s 2>/dev/null || echo 0; }
+fi
+
+# Local scratch directories.
+#   BACKUP_DIR   : the mydumper full-dump directory (also the upload root).
+#   BINLOG_DIR   : the incremental upload root, kept OUTSIDE BACKUP_DIR so a
+#                  full dump is never confused with an incremental archive.
 BACKUP_DIR="backup"
+BINLOG_DIR="binlog_archive"
+MYSQL_BINLOG_BASE_DIR="mysql_binlogs"
+# Default location of mysqlbinlog (installed via the Dockerfile). Overridable
+# for tests and unusual images.
+MYSQLBINLOG_BIN="${MYSQLBINLOG_BIN:-mysqlbinlog}"
+# MySQL client used for SHOW VARIABLES / SHOW BINARY LOGS / SHOW MASTER STATUS.
+MYSQL_CLIENT_BIN="${MYSQL_CLIENT_BIN:-mysql}"
+# Result of the binlog_format probe (ROW | STATEMENT | MIXED).
+BINLOG_FORMAT_PROBED=""
+# Remote (R2) path of the small JSON state object that drives the policy.
+BACKUP_STATE_REMOTE="${R2_PATH%/}/state/backup_state.json"
 
 # ---------------------------------------------------------------------------
 # rclone config location
@@ -121,6 +253,46 @@ VERIFIED_AT=""
 STORAGE_PATH=""
 ERROR_MESSAGE=""
 
+# Incremental-specific report metadata (empty for FULL / daily_snapshot).
+BASE_BACKUP_NAME=""
+BASE_FULL_STORAGE_PATH=""
+BINLOG_FILE_START=""
+BINLOG_FILE_END=""
+BINLOG_POSITION_START=""
+BINLOG_POSITION_END=""
+
+# Per-stage return codes and anchor usability.
+#
+# WHY THESE EXIST: a backup is a CHAIN of stages, and each stage's return code
+# must never silently become (or be mistaken for) the job's exit status. A log
+# that shows only a final "status=1" is not diagnosable, because the failure
+# report ("status=failed") and the success report ("status=success") both come
+# back as HTTP 200 from the reporter. These globals are printed immediately
+# before the process exits so the exact failing stage is always explicit.
+FULL_BACKUP_RC="n/a"
+UPLOAD_RC="n/a"
+VERIFY_RC="n/a"
+REPORT_RC="n/a"
+STATE_UPDATE_RC="n/a"
+LOCK_RELEASE_RC="n/a"
+BINLOG_ANCHOR_OK="no"
+LAST_STAGE_STATUS="none"
+
+# Parsed backup state (the latest known SUCCESSFUL, VERIFIED full backup and the
+# incremental binlog boundary). Empty strings mean "unknown".
+STATE_PRESENT=0
+ST_LAST_FULL_NAME=""
+ST_LAST_FULL_COMPLETED_AT=""
+ST_LAST_FULL_STORAGE_PATH=""
+ST_LAST_BINLOG_FILE=""
+ST_LAST_BINLOG_POSITION=""
+ST_LAST_BINLOG_END_FILE=""
+ST_LAST_BINLOG_END_POSITION=""
+
+# Raw state object as retrieved from R2 (used to re-validate the lock owner just
+# before the state is advanced, so a stale lock takeover cannot interleave).
+ST_RAW_STATE=""
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -131,6 +303,44 @@ log() {
 
 warn() {
   echo "[backup][warn] $*" >&2
+}
+
+# Record and log one stage's return code explicitly.
+#
+#   report_stage_rc <stage-name> <rc>
+#
+# Every stage that can influence the exit status is reported through here so the
+# log answers "which stage returned non-zero?" directly, instead of requiring an
+# operator to infer it from a single terminal status line.
+report_stage_rc() {
+  local stage="$1"
+  local rc="$2"
+  LAST_STAGE_STATUS="${stage}=${rc}"
+  if [[ "$rc" -eq 0 ]]; then
+    log "DIAG ${stage}: rc=0"
+  else
+    warn "DIAG ${stage}: rc=${rc} (NON-ZERO)"
+  fi
+}
+
+# Print the full per-stage diagnosis immediately before exiting. Never prints a
+# secret: only stage names, numeric return codes, the sanitized backup name, and
+# the binlog anchor coordinates (none of which are credentials).
+#
+#   log_exit_diagnosis <final_status> [reason]
+log_exit_diagnosis() {
+  local final_status="$1"
+  local reason="${2:-}"
+  warn "EXIT-DIAGNOSIS: final_status=${final_status} stage=${CURRENT_STAGE:-?} last_stage_status=${LAST_STAGE_STATUS:-none}"
+  warn "EXIT-DIAGNOSIS: backup_type=${BACKUP_TYPE:-n/a} backup_name=${BACKUP_NAME:-n/a}"
+  warn "EXIT-DIAGNOSIS: full_backup_rc=${FULL_BACKUP_RC} upload_rc=${UPLOAD_RC} verify_rc=${VERIFY_RC} report_rc=${REPORT_RC} state_update_rc=${STATE_UPDATE_RC} lock_release_rc=${LOCK_RELEASE_RC}"
+  warn "EXIT-DIAGNOSIS: binlog_anchor_usable=${BINLOG_ANCHOR_OK} anchor_file='${BINLOG_FILE_END:-<empty>}' anchor_position='${BINLOG_POSITION_END:-<empty>}'"
+  if [[ -n "$reason" ]]; then
+    warn "EXIT-DIAGNOSIS: reason=${reason}"
+  fi
+  if [[ -n "${ERROR_MESSAGE:-}" ]]; then
+    warn "EXIT-DIAGNOSIS: error_message='${ERROR_MESSAGE}'"
+  fi
 }
 
 # Validate that all required configuration is present. Exits non-zero (without
@@ -151,6 +361,23 @@ validate_env() {
     warn "Refusing to run: required configuration is missing. The job will not run a backup without PUPTracker reporting configured."
     exit 1
   fi
+
+  # A replication client identity MUST be a positive integer in the MySQL
+  # server_id range. An empty/junk value would make mysqlbinlog --raw fail, so
+  # reject it here with a clear message instead of failing deep in the capture.
+  if ! [[ "${MYSQLBINLOG_SERVER_ID:-}" =~ ^[0-9]+$ ]] || [[ "${MYSQLBINLOG_SERVER_ID:-0}" -lt 1 ]] || [[ "${MYSQLBINLOG_SERVER_ID:-0}" -gt 4294967295 ]]; then
+    warn "MYSQLBINLOG_SERVER_ID must be an integer in 1..4294967295 (got '${MYSQLBINLOG_SERVER_ID:-<unset>}')."
+    warn "Refusing to run: mysqlbinlog --read-from-remote-server requires a valid, unique server id."
+    exit 1
+  fi
+
+  # The fetch strategy must be one we implement, otherwise a typo would silently
+  # fall through to the default and confuse operators.
+  if [[ "${BINLOG_FETCH_STRATEGY:-}" != "raw" && "${BINLOG_FETCH_STRATEGY:-}" != "copy" ]]; then
+    warn "BINLOG_FETCH_STRATEGY must be 'raw' or 'copy' (got '${BINLOG_FETCH_STRATEGY:-<unset>}')."
+    warn "Refusing to run: unknown binary-log fetch strategy."
+    exit 1
+  fi
 }
 
 # Verify every external command this script relies on is actually present in
@@ -160,13 +387,48 @@ check_tools() {
   local missing=0
   local tool
 
+  # `dirname` is used unconditionally to derive RCLONE_CONFIG_DIR from
+  # RCLONE_CONFIG, so it is as required as the rest of this list. It is also
+  # listed in the Dockerfile's build-time verification, and keeping the runtime
+  # list in sync with the build-time list means a mis-built image fails at START
+  # with a named tool instead of mid-run.
   for tool in mydumper rclone curl date find sha256sum sed awk grep sort \
-               wc head mktemp tr; do
+               wc head mktemp tr dirname; do
     if ! command -v "$tool" >/dev/null 2>&1; then
       warn "Required command not found in image: ${tool}"
       missing=1
     fi
   done
+
+  # The `copy` fetch strategy does not shell out to mysqlbinlog but does need a
+  # readable binlog directory; validate that before the capture starts.
+  if [[ "${BINLOG_FETCH_STRATEGY:-raw}" == "copy" ]]; then
+    if [[ -z "${BINLOG_LOCAL_DIR:-}" ]]; then
+      warn "BINLOG_FETCH_STRATEGY=copy requires BINLOG_LOCAL_DIR to be set."
+      missing=1
+    elif [[ ! -d "$BINLOG_LOCAL_DIR" ]]; then
+      warn "BINLOG_FETCH_STRATEGY=copy requires BINLOG_LOCAL_DIR to be an existing directory."
+      missing=1
+    fi
+  fi
+
+  # Binlog tooling is required ONLY when binary-log incrementals are enabled.
+  # gzip is used to compress the archived binlog stream; mysql/mysqlbinlog are
+  # used to read the binlog boundary and to extract the events. Keeping these
+  # checks here (not in the Dockerfile alone) means a mis-built image fails
+  # loudly instead of producing a fake incremental.
+  if [[ "${BACKUP_BINLOG_ENABLED:-true}" == "true" ]]; then
+    for tool in mysql gzip; do
+      if ! command -v "$tool" >/dev/null 2>&1; then
+        warn "Required command not found in image (binary-log backups enabled): ${tool}"
+        missing=1
+      fi
+    done
+    if ! command -v "$MYSQLBINLOG_BIN" >/dev/null 2>&1; then
+      warn "Required command not found in image (binary-log backups enabled): ${MYSQLBINLOG_BIN}"
+      missing=1
+    fi
+  fi
 
   if [[ "$missing" -ne 0 ]]; then
     warn "Refusing to run: required command(s) are missing from the container image."
@@ -174,10 +436,9 @@ check_tools() {
   fi
 }
 
-# An ISO-8601-ish UTC timestamp (second precision). GNU date is assumed.
-now_utc() {
-  date -u +"%Y-%m-%dT%H:%M:%SZ"
-}
+# An ISO-8601-ish UTC timestamp (second precision) is provided by now_utc(),
+# defined above next to the clock-override seams so that a test harness can pin
+# time by defining now_utc()/now_epoch()/ts_to_epoch() before sourcing.
 
 # Escape a string for safe inclusion inside a double-quoted JSON string value.
 json_escape() {
@@ -203,12 +464,19 @@ safe_log_error() {
 #
 #   report_now <status>   e.g. report_now success | report_now failed
 #
+# On success sets REPORT_LAST_HTTP_CODE and clears REPORT_CONFLICT=0. On a 409
+# (the reporter refused the payload as an integrity conflict) it sets
+# REPORT_CONFLICT=1 so the caller can return the distinct exit code.
+REPORT_LAST_HTTP_CODE=""
+REPORT_CONFLICT=0
 report_now() {
   local status="$1"
   local http_code
   local payload
   local resp_file
   resp_file="$(mktemp)"
+  REPORT_LAST_HTTP_CODE=""
+  REPORT_CONFLICT=0
 
   if [[ -z "$BACKUP_REPORT_URL" ]]; then
     warn "BACKUP_REPORT_URL is not set; skipping PUPTracker report."
@@ -234,10 +502,28 @@ report_now() {
       --data-binary "$payload" || true
   )"
 
+  REPORT_LAST_HTTP_CODE="$http_code"
+
   if [[ "$http_code" =~ ^[0-9]+$ ]] && [[ "$http_code" -ge 200 ]] && [[ "$http_code" -lt 300 ]]; then
-    log "PUPTracker report accepted (HTTP ${http_code}) for ${BACKUP_NAME}."
+    # The report's own status is logged because the reporter answers HTTP 200 for
+    # BOTH a success report and a failure report. Without this, a successful
+    # transmission of a FAILURE report is indistinguishable from a successful
+    # transmission of a SUCCESS report in the log.
+    log "PUPTracker report (backup status '${status}') accepted (HTTP ${http_code}) for ${BACKUP_NAME}."
+    REPORT_RC=0
     rm -f "$resp_file"
     return 0
+  fi
+
+  # 409 = the reporter already has a record for this backup_name whose checksum
+  # differs. That is a real integrity conflict (not a transport problem), so it
+  # must never be retried blindly nor mistaken for a normal report failure.
+  if [[ "$http_code" == "409" ]]; then
+    REPORT_CONFLICT=1
+    warn "PUPTracker rejected the report (HTTP 409): a backup with this name already exists with a different checksum."
+    REPORT_RC=1
+    rm -f "$resp_file"
+    return 1
   fi
 
   # 401/403 means the token is wrong/missing; surface a generic hint only.
@@ -247,6 +533,7 @@ report_now() {
     warn "PUPTracker report failed (HTTP ${http_code:-timeout/no-response}) for ${BACKUP_NAME}."
   fi
 
+  REPORT_RC=1
   rm -f "$resp_file"
   return 1
 }
@@ -279,6 +566,33 @@ build_payload() {
     if [[ -n "$STORAGE_PATH" ]]; then
       json+=",\"storage_path\":\"$(json_escape "$STORAGE_PATH")\""
     fi
+
+    # Recovery-chain metadata for TRUE incrementals. Only emitted when present
+    # so FULL / daily_snapshot payloads are byte-for-byte unchanged.
+    #
+    # NOTE: base_backup_name maps to PUPTracker's nullable `parent_backup_id`
+    # relationship only by NAME on the reporter side; the webhook accepts the
+    # binlog_* fields directly (see BackupHistoryController). We send the
+    # base backup's NAME (human-meaningful for restore) plus the binlog
+    # boundary, and never invent values.
+    if [[ -n "$BASE_BACKUP_NAME" ]]; then
+      json+=",\"base_backup_name\":\"$(json_escape "$BASE_BACKUP_NAME")\""
+    fi
+    if [[ -n "$BASE_FULL_STORAGE_PATH" ]]; then
+      json+=",\"base_full_storage_path\":\"$(json_escape "$BASE_FULL_STORAGE_PATH")\""
+    fi
+    if [[ -n "$BINLOG_FILE_START" ]]; then
+      json+=",\"binlog_file_start\":\"$(json_escape "$BINLOG_FILE_START")\""
+    fi
+    if [[ -n "$BINLOG_POSITION_START" ]]; then
+      json+=",\"binlog_position_start\":${BINLOG_POSITION_START}"
+    fi
+    if [[ -n "$BINLOG_FILE_END" ]]; then
+      json+=",\"binlog_file_end\":\"$(json_escape "$BINLOG_FILE_END")\""
+    fi
+    if [[ -n "$BINLOG_POSITION_END" ]]; then
+      json+=",\"binlog_position_end\":${BINLOG_POSITION_END}"
+    fi
   fi
 
   json+="}"
@@ -288,15 +602,20 @@ build_payload() {
 # ---------------------------------------------------------------------------
 # Metadata helpers
 # ---------------------------------------------------------------------------
+# Each helper takes an optional directory argument (defaulting to $BACKUP_DIR,
+# the full-dump root) so the SAME deterministic metadata/checksum logic is used
+# for a FULL dump and for an incremental binlog archive.
 
-# Count files (not directories) under the backup dir.
+# Count files (not directories) under the given directory.
 count_files() {
-  find "$BACKUP_DIR" -type f 2>/dev/null | wc -l
+  local dir="${1:-$BACKUP_DIR}"
+  find "$dir" -type f 2>/dev/null | wc -l
 }
 
-# Total size in bytes of all files under the backup dir.
+# Total size in bytes of all files under the given directory.
 total_size() {
-  find "$BACKUP_DIR" -type f -printf "%s\n" 2>/dev/null | awk '{ s += $1 } END { print s+0 }'
+  local dir="${1:-$BACKUP_DIR}"
+  find "$dir" -type f -printf "%s\n" 2>/dev/null | awk '{ s += $1 } END { print s+0 }'
 }
 
 # Deterministic aggregate SHA-256 over a sorted manifest of every backup file.
@@ -305,13 +624,14 @@ total_size() {
 #
 # The manifest is sorted by relative path so the result is reproducible.
 compute_manifest_checksum() {
+  local dir="${1:-$BACKUP_DIR}"
   local manifest
   local aggregate
   manifest="$(mktemp)"
 
   # Build the manifest: hash + two-space separator + relative path.
   (
-    cd "$BACKUP_DIR"
+    cd "$dir"
     find . -type f -print0 2>/dev/null | sort -z \
       | while IFS= read -r -d '' f; do
           rel="${f#./}"
@@ -341,22 +661,25 @@ compute_manifest_checksum() {
 #     been independently re-derived from the remote bytes.
 #
 # Returns 0 when the remote count and total size both match the local values.
+#   verify_upload [<local_dir>] [<remote_path>]
 verify_upload() {
+  local dir="${1:-$BACKUP_DIR}"
+  local remote_path="${2:-${R2_BUCKET}/${STORAGE_PATH}}"
   local local_count
   local remote_count
   local local_bytes
   local remote_bytes
   local size_json
 
-  local_count="$(count_files)"
-  local_bytes="$(total_size)"
+  local_count="$(count_files "$dir")"
+  local_bytes="$(total_size "$dir")"
 
   # Ask rclone for the authoritative remote object count + total bytes as a
   # single line of JSON: {"count":N,"bytes":M,"sizeless":K}. The --config flag
   # guarantees rclone reads OUR config regardless of HOME. If the command
   # fails, capture nothing (the empty result is treated as an unparseable/
   # failed verification below rather than a silent success).
-  size_json="$(rclone --config "$RCLONE_CONFIG" size --json "remote:${R2_BUCKET}/${STORAGE_PATH}" 2>/dev/null || true)"
+  size_json="$(rclone --config "$RCLONE_CONFIG" size --json "remote:${remote_path}" 2>/dev/null || true)"
 
   # Parse the JSON with sed (not human-readable output). On a well-formed
   # single-line object these extract the numeric fields; on malformed or empty
@@ -366,21 +689,21 @@ verify_upload() {
 
   # Fail if the JSON could not be parsed or rclone size did not succeed.
   if [[ -z "$remote_count" || -z "$remote_bytes" ]]; then
-    warn "R2 presence/size verification could not read the remote size at remote:${R2_BUCKET}/${STORAGE_PATH}."
+    warn "R2 presence/size verification could not read the remote size at remote:${remote_path}."
     return 1
   fi
 
   if [[ "$local_count" -ne "$remote_count" ]]; then
-    warn "R2 presence/size verification failed: expected ${local_count} file(s), found ${remote_count} at remote:${R2_BUCKET}/${STORAGE_PATH}."
+    warn "R2 presence/size verification failed: expected ${local_count} file(s), found ${remote_count} at remote:${remote_path}."
     return 1
   fi
 
   if [[ "$local_bytes" -ne "$remote_bytes" ]]; then
-    warn "R2 presence/size verification failed: expected ${local_bytes} bytes, found ${remote_bytes} at remote:${R2_BUCKET}/${STORAGE_PATH}."
+    warn "R2 presence/size verification failed: expected ${local_bytes} bytes, found ${remote_bytes} at remote:${remote_path}."
     return 1
   fi
 
-  log "R2 presence/size verification passed: ${remote_count} file(s), ${remote_bytes} bytes at remote:${R2_BUCKET}/${STORAGE_PATH}."
+  log "R2 presence/size verification passed: ${remote_count} file(s), ${remote_bytes} bytes at remote:${remote_path}."
   return 0
 }
 
@@ -400,9 +723,1118 @@ report_failure_and_exit() {
   safe_log_error "$message"
   log "Attempting to report backup failure to PUPTracker..."
 
-  report_now "failed" || warn "Could not deliver failure report to PUPTracker (backup already failed)."
+  # report_now returns non-zero when the report itself cannot be delivered. That
+  # return code must NOT replace the caller's intended exit code: the job failed
+  # for $message's reason, not because the failure report bounced.
+  local report_rc=0
+  report_now "failed" || report_rc=$?
+  if [[ "$report_rc" -ne 0 ]]; then
+    warn "Could not deliver failure report to PUPTracker (backup already failed)."
+  fi
+  REPORT_RC="$report_rc"
 
+  log_exit_diagnosis "failed" "${message}"
   exit "$code"
+}
+
+# ---------------------------------------------------------------------------
+# Backup state (R2 JSON object) — the single source of truth for the policy
+# ---------------------------------------------------------------------------
+# The container has NO direct access to the PUPTracker database, so backup
+# state is persisted as a small JSON object in R2 at:
+#     <R2_PATH>/state/backup_state.json
+#
+# It records the latest SUCCESSFUL, VERIFIED full backup and the incremental
+# binlog boundary. It is ONLY advanced after a run has: completed, uploaded,
+# passed R2 verification, AND been reported to PUPTracker (see update_state).
+#
+# JSON is read/parsed with sed (no jq dependency). Every value is a string or
+# integer, never a secret.
+
+# ---------------------------------------------------------------------------
+# Distributed lock (object storage) — protects the incremental state
+# ---------------------------------------------------------------------------
+# The state object is READ-MODIFY-WRITE. Without mutual exclusion, two runs can
+# both read the same "last end position", both capture overlapping binlog
+# ranges, and both write state — producing duplicate/overlapping archives and a
+# state value that does not reflect what is actually in R2.
+#
+# Two layers are used:
+#   1. `rclone copyto` does NOT overwrite an existing object, so creating the
+#      lock object is an atomic create-if-absent (test-and-set) in R2.
+#   2. A LOCAL best-effort mkdir lock keeps a single container from racing
+#      itself during the create-check window.
+#
+# The lock object contains an expiry timestamp (now + BACKUP_LOCK_TTL_SECONDS)
+# and a random token. An EXPIRED lock is treated as stale and taken over, so a
+# crashed run can never permanently wedge the chain. The token is re-checked
+# immediately before the state is advanced; if it no longer matches, another run
+# took the lock over and this run aborts WITHOUT touching state.
+
+# Read the "expires_at" epoch from the lock object; prints 0 when unreadable.
+lock_expiry_epoch() {
+  local raw
+  raw="$(rclone --config "${RCLONE_CONFIG:-}" cat "remote:${BACKUP_LOCK_REMOTE}" 2>/dev/null || true)"
+  [[ -z "$raw" ]] && { printf '0'; return 0; }
+  printf '%s' "$raw" | sed -n 's/.*"expires_at_epoch"[[:space:]]*:[[:space:]]*\([0-9][0-9]*\).*/\1/p' | head -n1
+  return 0
+}
+
+# Print the token recorded in the lock object (empty when unreadable).
+lock_token() {
+  local raw
+  raw="$(rclone --config "${RCLONE_CONFIG:-}" cat "remote:${BACKUP_LOCK_REMOTE}" 2>/dev/null || true)"
+  [[ -z "$raw" ]] && return 0
+  printf '%s' "$raw" | sed -n 's/.*"token"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -n1
+  return 0
+}
+
+# Acquire the distributed lock. Returns 0 when held, 1 when another live run
+# holds it. Never exits: the caller decides how to react.
+acquire_lock() {
+  BACKUP_LOCK_HELD=0
+  BACKUP_LOCK_TOKEN=""
+
+  if [[ "${BACKUP_LOCK_ENABLED:-true}" != "true" ]]; then
+    log "Distributed lock disabled (BACKUP_LOCK_ENABLED=false)."
+    return 0
+  fi
+
+  # Each attempt gets a fresh token so a take-over is distinguishable.
+  local token="${BACKUP_LOCK_TOKEN_PREFIX:-}${RANDOM}${RANDOM}-$(now_epoch)-$$"
+  local ttl="${BACKUP_LOCK_TTL_SECONDS:-21600}"
+  [[ "$ttl" =~ ^[0-9]+$ ]] || ttl=21600
+  local now expires payload tmp attempts=0
+
+  while :; do
+    attempts=$((attempts + 1))
+    now="$(now_epoch)"
+    expires=$((now + ttl))
+    tmp="$(mktemp)"
+    printf '{\n  "holder": "%s",\n  "token": "%s",\n  "acquired_at_epoch": %s,\n  "expires_at_epoch": %s\n}\n' \
+      "$(json_escape "${HOSTNAME:-unknown}")" "$(json_escape "$token")" "$now" "$expires" > "$tmp"
+    payload="$tmp"
+
+    # Atomic create-if-absent: copyto refuses to overwrite an existing object.
+    if rclone --config "${RCLONE_CONFIG:-}" copyto "$payload" "remote:${BACKUP_LOCK_REMOTE}" >/dev/null 2>&1; then
+      # Confirm WE are the recorded owner (copyto could have succeeded against a
+      # backend that overwrites); discard the lock if not.
+      rm -f "$payload"
+      if [[ "$(lock_token)" == "$token" ]]; then
+        BACKUP_LOCK_HELD=1
+        BACKUP_LOCK_TOKEN="$token"
+        log "Acquired distributed backup lock (expires in ${ttl}s)."
+        return 0
+      fi
+      warn "Lock write was not acknowledged as ours; retrying lock acquisition."
+    else
+      rm -f "$payload"
+      local held_expiry
+      held_expiry="$(lock_expiry_epoch)"
+      if [[ "${held_expiry:-0}" =~ ^[0-9]+$ ]] && [[ "${held_expiry:-0}" -gt 0 ]] && [[ "$held_expiry" -le "$now" ]]; then
+        warn "Found a stale backup lock (expired at epoch ${held_expiry}); taking it over."
+        rclone --config "${RCLONE_CONFIG:-}" deletefile "remote:${BACKUP_LOCK_REMOTE}" >/dev/null 2>&1 || true
+      fi
+    fi
+
+    if [[ "$attempts" -ge 2 ]]; then
+      return 1
+    fi
+  done
+}
+
+# Release the lock, but ONLY when we are still its owner (a stale take-over by
+# another run must not have its lock deleted by us).
+release_lock() {
+  if [[ "${BACKUP_LOCK_HELD:-0}" != "1" ]]; then
+    return 0
+  fi
+  local token
+  token="$(lock_token)"
+  if [[ -n "$token" && "$token" != "${BACKUP_LOCK_TOKEN:-}" ]]; then
+    warn "Backup lock is now owned by another run; not releasing it."
+    BACKUP_LOCK_HELD=0
+    return 0
+  fi
+  rclone --config "${RCLONE_CONFIG:-}" deletefile "remote:${BACKUP_LOCK_REMOTE}" >/dev/null 2>&1 || true
+  BACKUP_LOCK_HELD=0
+  log "Released distributed backup lock."
+  return 0
+}
+
+# Combined EXIT cleanup: always release the lock (so a crash never wedges the
+# chain) and still report the stage/status the way report_exit() does.
+# The exit status is captured FIRST so releasing the lock cannot mask it.
+cleanup_on_exit() {
+  # Capture the REAL status first. Everything below (lock release, logging) is
+  # cleanup and must never be able to mask or replace it: release_lock() only
+  # ever returns 0 today, but relying on that would make the job's exit status
+  # depend on a cleanup helper's return value.
+  local status=$?
+
+  release_lock || true
+  LOCK_RELEASE_RC=$?
+  # NOTE: LOCK_RELEASE_RC is recorded but deliberately does NOT overwrite
+  # LAST_STAGE_STATUS. Cleanup is not a backup stage, and letting it overwrite
+  # the last recorded stage would make the exit diagnosis point at cleanup
+  # instead of at the stage that actually failed.
+
+  if [[ "$status" -ne 0 ]]; then
+    log_exit_diagnosis "failed" "exit_status=${status}${ERROR_MESSAGE:+ error='${ERROR_MESSAGE}'}"
+  else
+    log "EXIT-DIAGNOSIS: final_status=success stage=${CURRENT_STAGE:-?} last_stage_status=${LAST_STAGE_STATUS:-none}"
+    log "EXIT-DIAGNOSIS: backup_type=${BACKUP_TYPE:-n/a} backup_name=${BACKUP_NAME:-n/a}"
+    log "EXIT-DIAGNOSIS: full_backup_rc=${FULL_BACKUP_RC} upload_rc=${UPLOAD_RC} verify_rc=${VERIFY_RC} report_rc=${REPORT_RC} state_update_rc=${STATE_UPDATE_RC} lock_release_rc=${LOCK_RELEASE_RC}"
+    log "EXIT-DIAGNOSIS: binlog_anchor_usable=${BINLOG_ANCHOR_OK} anchor_file='${BINLOG_FILE_END:-<empty>}' anchor_position='${BINLOG_POSITION_END:-<empty>}'"
+  fi
+
+  # Explicitly re-assert the captured status so no cleanup step can change it.
+  return "$status"
+}
+
+# Verify we still own the lock. Returns non-zero when it was taken over (or is
+# unreadable), meaning this run must NOT advance state.
+lock_still_owned() {
+  if [[ "${BACKUP_LOCK_HELD:-0}" != "1" ]]; then
+    return 0
+  fi
+  local token
+  token="$(lock_token)"
+  if [[ "$token" == "${BACKUP_LOCK_TOKEN:-}" ]]; then
+    return 0
+  fi
+  warn "Backup lock ownership was lost (another run took over the expired lock)."
+  return 1
+}
+
+# Load the state object from R2 into the ST_* variables. Sets STATE_PRESENT=1
+# only when a syntactically usable object was retrieved. Never fails the run:
+# an absent/corrupt state simply means "no known state" (=> force FULL).
+load_state() {
+  local state_file
+  state_file="$(mktemp)"
+  STATE_PRESENT=0
+
+  # `rclone cat` streams the object to stdout; a missing object returns empty.
+  local raw
+  raw="$(rclone --config "${RCLONE_CONFIG:-}" cat "remote:${BACKUP_STATE_REMOTE}" 2>/dev/null || true)"
+  ST_RAW_STATE="$raw"
+
+  if [[ -z "$raw" ]]; then
+    log "Backup state: none found at remote:${BACKUP_STATE_REMOTE} (first run or state absent)."
+    rm -f "$state_file"
+    return 0
+  fi
+
+  # Cheap structural check: must contain the full-backup key.
+  if ! printf '%s' "$raw" | grep -q '"last_successful_full_backup_name"'; then
+    warn "Backup state at remote:${BACKUP_STATE_REMOTE} is unreadable/foreign; ignoring it."
+    rm -f "$state_file"
+    return 0
+  fi
+
+  # Extract scalar string values. The sed pattern captures everything up to the
+  # closing quote; values never contain quotes (they are backup names/paths).
+  ST_LAST_FULL_NAME="$(printf '%s' "$raw" | sed -n 's/.*"last_successful_full_backup_name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')"
+  ST_LAST_FULL_COMPLETED_AT="$(printf '%s' "$raw" | sed -n 's/.*"last_successful_full_completed_at"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')"
+  ST_LAST_FULL_STORAGE_PATH="$(printf '%s' "$raw" | sed -n 's/.*"last_successful_full_storage_path"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')"
+  ST_LAST_BINLOG_FILE="$(printf '%s' "$raw" | sed -n 's/.*"last_binlog_file"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')"
+  ST_LAST_BINLOG_END_FILE="$(printf '%s' "$raw" | sed -n 's/.*"last_binlog_end_file"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')"
+  # Positions are plain integers.
+  ST_LAST_BINLOG_POSITION="$(printf '%s' "$raw" | sed -n 's/.*"last_binlog_position"[[:space:]]*:[[:space:]]*\([0-9][0-9]*\).*/\1/p')"
+  ST_LAST_BINLOG_END_POSITION="$(printf '%s' "$raw" | sed -n 's/.*"last_binlog_end_position"[[:space:]]*:[[:space:]]*\([0-9][0-9]*\).*/\1/p')"
+
+  rm -f "$state_file"
+
+  if [[ -n "$ST_LAST_FULL_NAME" ]]; then
+    STATE_PRESENT=1
+    log "Backup state loaded: last successful FULL = ${ST_LAST_FULL_NAME} (completed ${ST_LAST_FULL_COMPLETED_AT:-unknown})."
+  else
+    log "Backup state exists but records no successful FULL yet."
+  fi
+
+  return 0
+}
+
+# Persist the state object to R2. Called ONLY after success + upload + verify +
+# PUPTracker report. Values are passed explicitly so the caller controls exactly
+# which fields advance (a FULL advances the base + binlog anchor; an incremental
+# advances only the binlog boundary).
+#
+#   update_state <full_name> <full_completed_at> <full_storage_path> \
+#                <binlog_file> <binlog_position> <binlog_end_file> <binlog_end_position>
+update_state() {
+  local full_name="$1"
+  local full_completed_at="$2"
+  local full_storage_path="$3"
+  local binlog_file="$4"
+  local binlog_position="$5"
+  local binlog_end_file="$6"
+  local binlog_end_position="$7"
+
+  local state_file
+  state_file="$(mktemp)"
+  printf '{\n' > "$state_file"
+  printf '  "state_version": 1,\n' >> "$state_file"
+  printf '  "updated_at": "%s",\n' "$(now_utc)" >> "$state_file"
+  printf '  "last_successful_full_backup_name": "%s",\n' "$(json_escape "$full_name")" >> "$state_file"
+  printf '  "last_successful_full_completed_at": "%s",\n' "$(json_escape "$full_completed_at")" >> "$state_file"
+  printf '  "last_successful_full_storage_path": "%s",\n' "$(json_escape "$full_storage_path")" >> "$state_file"
+  printf '  "last_binlog_file": "%s",\n' "$(json_escape "$binlog_file")" >> "$state_file"
+  printf '  "last_binlog_position": %s,\n' "${binlog_position:-0}" >> "$state_file"
+  printf '  "last_binlog_end_file": "%s",\n' "$(json_escape "$binlog_end_file")" >> "$state_file"
+  printf '  "last_binlog_end_position": %s\n' "${binlog_end_position:-0}" >> "$state_file"
+  printf '}\n' >> "$state_file"
+
+  if ! rclone --config "$RCLONE_CONFIG" copyto "$state_file" "remote:${BACKUP_STATE_REMOTE}"; then
+    rm -f "$state_file"
+    warn "Failed to persist backup state to remote:${BACKUP_STATE_REMOTE}."
+    return 1
+  fi
+
+  rm -f "$state_file"
+  log "Backup state updated at remote:${BACKUP_STATE_REMOTE}."
+  return 0
+}
+
+# ---------------------------------------------------------------------------
+# Backup-type decision
+# ---------------------------------------------------------------------------
+# Determine "full" or "incremental" and store it in the global DECIDED_TYPE.
+# Logs the reason (never secrets). We use a GLOBAL rather than stdout because
+# the decision logic also logs, and command substitution would otherwise mix
+# log lines into the returned value.
+#
+# Rules (absolute):
+#   * No valid successful FULL known  -> FULL  ("no valid full base").
+#   * Now - last_successful_full >= BACKUP_FULL_INTERVAL_DAYS -> FULL.
+#   * Otherwise -> incremental.
+#
+# The decision is based on the MOST RECENT SUCCESSFUL, VERIFIED full (from
+# state), never on a merely-attempted full. A failed full never becomes base.
+DECIDED_TYPE=""
+determine_backup_type() {
+  local interval="${BACKUP_FULL_INTERVAL_DAYS:-14}"
+
+  # Guard against a non-numeric / nonsensical interval.
+  if ! [[ "$interval" =~ ^[0-9]+$ ]] || [[ "$interval" -lt 1 ]]; then
+    warn "BACKUP_FULL_INTERVAL_DAYS='${BACKUP_FULL_INTERVAL_DAYS}' is invalid; using 14."
+    interval=14
+  fi
+
+  if [[ "${STATE_PRESENT:-0}" -ne 1 || -z "$ST_LAST_FULL_NAME" ]]; then
+    log "No valid successful full backup exists; forcing FULL backup."
+    DECIDED_TYPE="full"
+    return 0
+  fi
+
+  local last_full_epoch now_epoch age_days
+  last_full_epoch="$(ts_to_epoch "$ST_LAST_FULL_COMPLETED_AT")"
+  now_epoch="$(now_epoch)"
+
+  if [[ "$last_full_epoch" -le 0 ]]; then
+    warn "Last successful full backup timestamp '${ST_LAST_FULL_COMPLETED_AT}' is unparseable; forcing FULL backup."
+    DECIDED_TYPE="full"
+    return 0
+  fi
+
+  age_days=$(( (now_epoch - last_full_epoch) / 86400 ))
+  log "Last successful full: ${ST_LAST_FULL_NAME} (${age_days} day(s) ago). Full interval is ${interval} day(s)."
+
+  if [[ "$age_days" -ge "$interval" ]]; then
+    log "Full backup is due (>= ${interval} days since last successful full)."
+    DECIDED_TYPE="full"
+    return 0
+  fi
+
+  DECIDED_TYPE="incremental"
+  return 0
+}
+
+# ---------------------------------------------------------------------------
+# MySQL binary-log helpers (TRUE incremental prerequisite)
+# ---------------------------------------------------------------------------
+
+# Run a single SQL statement against the target database and print the result.
+# Uses an option file so the password is never on the command line or in logs.
+mysql_query() {
+  local sql="$1"
+  local cnf
+  cnf="$(mktemp)"
+  chmod 600 "$cnf"
+  cat > "$cnf" <<EOF
+[client]
+host=${MYSQL_HOST}
+port=${MYSQL_PORT}
+user=${MYSQL_USER}
+password=${MYSQL_PASSWORD}
+EOF
+  local out
+  # -N -B => tab-separated, no column headers, no ASCII box.
+  out="$("$MYSQL_CLIENT_BIN" --defaults-extra-file="$cnf" -N -B -e "$sql" "$MYSQL_DATABASE" 2>/dev/null || true)"
+  rm -f "$cnf"
+  printf '%s' "$out"
+}
+
+# Verify binary logging is enabled and usable. Exits non-zero (via caller) with
+# a clear, non-secret message when it is not. Sets several global probe results
+# in variables the caller reads.
+#
+# Returns 0 when binlog is confirmed usable; 1 otherwise.
+check_mysql_binlog() {
+  local log_bin binlog_format
+  log_bin="$(mysql_query "SHOW VARIABLES LIKE 'log_bin';" | awk -F'\t' '{print $2}')"
+  binlog_format="$(mysql_query "SHOW VARIABLES LIKE 'binlog_format';" | awk -F'\t' '{print $2}')"
+
+  log_bin="$(printf '%s' "$log_bin" | tr '[:lower:]' '[:upper:]' | tr -d '[:space:]')"
+  BINLOG_FORMAT_PROBED="$(printf '%s' "$binlog_format" | tr '[:lower:]' '[:upper:]' | tr -d '[:space:]')"
+
+  if [[ "$log_bin" != "ON" && "$log_bin" != "1" ]]; then
+    warn "MySQL binary logging is not enabled (log_bin='${log_bin:-unknown}')."
+    warn "TRUE incremental backups require binary logging. Configure the MySQL server with log_bin=ON."
+    return 1
+  fi
+
+  if [[ "$BINLOG_FORMAT_PROBED" != "ROW" && "$BINLOG_FORMAT_PROBED" != "STATEMENT" && "$BINLOG_FORMAT_PROBED" != "MIXED" ]]; then
+    warn "MySQL binlog_format='${BINLOG_FORMAT_PROBED:-unknown}' is not usable for extraction."
+    return 1
+  fi
+
+  log "MySQL binary logging verified: log_bin=ON, binlog_format=${BINLOG_FORMAT_PROBED}."
+  return 0
+}
+
+# Acquire the current binlog END boundary and print "file<TAB>position". This is
+# the current write point of the active binlog.
+#
+# SQL compatibility (MySQL 8.4):
+#   `SHOW MASTER STATUS` is DEPRECATED in MySQL 8.4 in favour of
+#   `SHOW BINARY LOG STATUS`, which returns the identical column layout
+#   (File, Position, Binlog_Do_DB, Binlog_Ignore_DB, Executed_Gtid_Set).
+#   MySQL <= 8.0 does not have `SHOW BINARY LOG STATUS`, so we probe the 8.4
+#   statement FIRST and safely FALL BACK to the legacy one. Both results are
+#   normalized into the SAME internal "file<TAB>position" representation, so
+#   the rest of the chain is statement-agnostic.
+#
+# Why there is NO FLUSH TABLES WITH READ LOCK here: the END boundary only needs
+# to be a point we will RESUME FROM next time. Binlog positions are monotonic,
+# so recording the current (file,position) and later reading [start, end] with
+# mysqlbinlog --stop-position is gap-free and duplicate-free even if writes
+# continue after we read it (those later events have positions greater than end
+# and are picked up by the NEXT incremental). Avoiding FTWRL also avoids
+# requiring the RELOAD privilege and avoids unnecessary database locking.
+acquire_binlog_boundary() {
+  local out
+  local stmt
+
+  # Prefer the MySQL 8.4 statement; fall back to the legacy statement. Both are
+  # validated through the same normalizer, so a statement that succeeds but
+  # yields no usable row falls through to the other.
+  #
+  # NOTE: the informational note is written to STDERR. This function's STDOUT is
+  # the returned "file<TAB>position" value (callers use command substitution), so
+  # anything written to stdout would corrupt the result.
+  for stmt in "SHOW BINARY LOG STATUS;" "SHOW MASTER STATUS;"; do
+    out="$(mysql_query "$stmt")"
+    if normalize_binlog_status "$out"; then
+      if [[ "$stmt" == "SHOW BINARY LOG STATUS;" ]]; then
+        echo "[backup] Binlog boundary read via SHOW BINARY LOG STATUS (MySQL 8.4+)." >&2
+      else
+        echo "[backup] Binlog boundary read via SHOW MASTER STATUS (legacy fallback)." >&2
+      fi
+      printf '%s\t%s' "$_BH_FILE" "$_BH_POSITION"
+      return 0
+    fi
+  done
+
+  printf ''
+  return 1
+}
+
+# Normalize a `SHOW BINARY LOG STATUS` / `SHOW MASTER STATUS` result into the
+# globals _BH_FILE and _BH_POSITION. Returns 0 when a usable pair was found.
+#
+# Both statements emit the same tab-separated columns under `-N -B`: the first
+# row is `File <TAB> Position <TAB> Binlog_Do_DB <TAB> Binlog_Ignore_DB <TAB>
+# Executed_Gtid_Set`. We deliberately scan for the first row whose first two
+# fields look like (binlog filename, integer position) instead of trusting
+# fixed offsets, so extra/empty trailing columns are tolerated.
+#
+# The filename pattern requires the standard `<basename>.<digits>` shape
+# (e.g. binlog.000070, mysql-bin.000070), which rejects an unrelated numeric
+# first column that would otherwise be mistaken for a binlog file.
+_BH_FILE=""
+_BH_POSITION=""
+normalize_binlog_status() {
+  local out="$1"
+  _BH_FILE=""
+  _BH_POSITION=""
+
+  if [[ -z "$out" ]]; then
+    return 1
+  fi
+
+  _BH_FILE="$(printf '%s\n' "$out" | awk -F'\t' 'NF>=2 && $1 ~ /^[A-Za-z0-9._-]*\.[0-9]+$/ && $2 ~ /^[0-9]+$/ {print $1; exit}')"
+  _BH_POSITION="$(printf '%s\n' "$out" | awk -F'\t' 'NF>=2 && $1 ~ /^[A-Za-z0-9._-]*\.[0-9]+$/ && $2 ~ /^[0-9]+$/ {print $2; exit}')"
+
+  if [[ -z "$_BH_FILE" || -z "$_BH_POSITION" ]]; then
+    return 1
+  fi
+
+  return 0
+}
+
+# Read the binlog coordinates recorded by mydumper in its dump metadata file.
+#
+# TWO metadata formats are supported, in this order:
+#
+# 1) MyDumper v0.21.x — the CURRENT format. Coordinates live in an INI-style
+#    [source] section and are only UNCOMMENTED when mydumper is run with
+#    --source-data:
+#
+#        [source]
+#        # SOURCE_LOG_FILE = "binlog.000123"     <-- DEFAULT (commented, USELESS)
+#        # SOURCE_LOG_POS = 456789
+#
+#    With --source-data the same keys become ACTIVE:
+#
+#        [source]
+#        SOURCE_LOG_FILE = "binlog.000123"
+#        SOURCE_LOG_POS = 456789
+#
+#    A COMMENTED key is never an anchor: that is exactly what mydumper writes
+#    when --source-data was NOT passed, so accepting it would fabricate an
+#    anchor for a dump that has none.
+#
+# 2) Legacy mydumper — a "SHOW MASTER STATUS:" / "SHOW BINARY LOG STATUS:"
+#    block with `Log:`/`File:` and `Pos:`/`Position:` labels. Retained so older
+#    dumps and existing deployments keep working.
+#
+# Whatever the format, this is the CONSISTENT SNAPSHOT position the dump
+# corresponds to, and is the ONLY correct anchor from which a subsequent
+# incremental may resume. A post-dump boundary would silently lose every
+# transaction written during the dump, which is why this function never queries
+# the server: the anchor must come from the dump's own metadata.
+#
+# Prints "file<TAB>position" or nothing.
+read_mydumper_binlog_anchor() {
+  local dir="${1:-$BACKUP_DIR}"
+  local meta="$dir/metadata"
+  if [[ ! -f "$meta" ]]; then
+    printf ''
+    return 1
+  fi
+
+  # Strip comment lines ONCE so neither parser below can ever mistake a
+  # commented-out coordinate for a real one. `#` may follow leading whitespace.
+  local active
+  active="$(grep -v -E '^[[:space:]]*#' "$meta" 2>/dev/null || true)"
+
+  local file position
+
+  # --- Format 1: MyDumper v0.21.x  [source] SOURCE_LOG_FILE / SOURCE_LOG_POS --
+  # Quotes are optional and trailing content is ignored, so both the quoted
+  # `SOURCE_LOG_FILE = "binlog.000123"` form and a bare value parse. The
+  # position pattern only accepts digits, so a non-numeric value yields nothing.
+  file="$(printf '%s\n' "$active" \
+    | sed -n -E 's/^[[:space:]]*SOURCE_LOG_FILE[[:space:]]*=[[:space:]]*"?([^"[:space:]]+)"?.*$/\1/p' \
+    | head -n1)"
+  position="$(printf '%s\n' "$active" \
+    | sed -n -E 's/^[[:space:]]*SOURCE_LOG_POS[[:space:]]*=[[:space:]]*([0-9]+).*/\1/p' \
+    | head -n1)"
+
+  if [[ -z "$file" || -z "$position" ]]; then
+    # --- Format 2 (legacy): binlog-status block with Log:/File: labels --------
+    # Start reading at the first binlog-status marker when one is present;
+    # otherwise the whole (comment-stripped) file is scanned.
+    local region="$active"
+    local marker_line
+    marker_line="$(printf '%s\n' "$active" | grep -n -i -m1 -E '(master|binary log) status' | cut -d: -f1 || true)"
+    if [[ -n "$marker_line" ]]; then
+      region="$(printf '%s\n' "$active" | tail -n "+${marker_line}")"
+    fi
+    file="$(printf '%s\n' "$region" | sed -n -E 's/^[[:space:]]*(Log|File):[[:space:]]*([^[:space:]]*).*/\2/p' | head -n1)"
+    position="$(printf '%s\n' "$region" | sed -n -E 's/^[[:space:]]*(Pos|Position):[[:space:]]*([0-9][0-9]*).*/\2/p' | head -n1)"
+  fi
+
+  # BOTH values are required; a half-populated anchor is not usable.
+  if [[ -z "$file" || -z "$position" ]]; then
+    printf ''
+    return 1
+  fi
+
+  # ...and they must actually LOOK like a binlog coordinate. A filename without
+  # the `<base>.<digits>` shape (e.g. `binlog.current`, or a stray object name) is
+  # rejected rather than persisted as a bogus anchor, and the position must be a
+  # positive integer.
+  if [[ ! "$file" =~ ^[A-Za-z0-9._-]+\.[0-9]+$ ]]; then
+    printf ''
+    return 1
+  fi
+  if [[ ! "$position" =~ ^[0-9]+$ ]] || [[ "$position" -le 0 ]]; then
+    printf ''
+    return 1
+  fi
+
+  printf '%s\t%s' "$file" "$position"
+  return 0
+}
+
+# List all binary log files currently retained by the server (one per line).
+list_binary_logs() {
+  mysql_query "SHOW BINARY LOGS;" | awk -F'\t' 'NF>=2 {print $1}'
+}
+
+# ---------------------------------------------------------------------------
+# FULL backup (existing MyDumper flow, preserved)
+# ---------------------------------------------------------------------------
+run_full_backup() {
+  BACKUP_TYPE="full"
+  BACKUP_NAME="full_$(date -u +"%Y-%m-%d_%H%M%S")"
+  local date_path
+  date_path="$(date -u +"%Y/%m/%d")"
+  # <R2_PATH>/full/YYYY/MM/DD/<backup_name>/
+  STORAGE_PATH="${R2_PATH%/}/full/${date_path}/${BACKUP_NAME}"
+
+  log "Backup type selected: FULL"
+  log "R2 destination: ${R2_BUCKET}/${STORAGE_PATH}"
+
+  # 1) Logical dump with mydumper into a fresh local directory.
+  #
+  # CREDENTIALS: the password is passed through a temporary --defaults-file
+  # (mode 600) rather than the command line. A command-line --password is
+  # visible to ANY process on the host via `ps`/`/proc/<pid>/cmdline`, so it
+  # would leak the MySQL password into container and node process listings.
+  set_stage "full_backup"
+  log "Stage: full_backup (started)"
+  rm -rf "$BACKUP_DIR"
+  local mydumper_cnf
+  mydumper_cnf="$(mktemp)"
+  chmod 600 "$mydumper_cnf"
+  # Both the standard [client] group and mydumper's own [mydumper] group are
+  # populated so the credentials are found regardless of which group this
+  # mydumper build reads; the non-secret connection parameters are ALSO passed
+  # on the command line so a build that ignores the file entirely still connects.
+  cat > "$mydumper_cnf" <<EOF
+[client]
+host=${MYSQL_HOST}
+port=${MYSQL_PORT}
+user=${MYSQL_USER}
+password=${MYSQL_PASSWORD}
+
+[mydumper]
+host=${MYSQL_HOST}
+port=${MYSQL_PORT}
+user=${MYSQL_USER}
+password=${MYSQL_PASSWORD}
+EOF
+  local mydumper_rc=0
+  # --source-data makes mydumper write the CONSISTENT-SNAPSHOT binlog
+  # coordinates (SOURCE_LOG_FILE / SOURCE_LOG_POS) UNCOMMENTED into the
+  # metadata file. Without it those keys are written commented-out and the FULL
+  # has no anchor, so no incremental can ever start from it. The coordinates
+  # recorded here describe the exact instant the snapshot was taken, which is
+  # what makes the FULL -> INCREMENTAL chain gap-free.
+  mydumper \
+    --defaults-file="$mydumper_cnf" \
+    --host "$MYSQL_HOST" \
+    --user "$MYSQL_USER" \
+    --port "$MYSQL_PORT" \
+    --database "$MYSQL_DATABASE" \
+    --source-data \
+    -C -c --clear -o "$BACKUP_DIR" || mydumper_rc=$?
+  rm -f "$mydumper_cnf"
+  if [[ "$mydumper_rc" -ne 0 ]]; then
+    FULL_BACKUP_RC="$mydumper_rc"
+    report_failure_and_exit "mydumper failed to produce a logical database snapshot."
+  fi
+
+  if [[ ! -d "$BACKUP_DIR" ]]; then
+    FULL_BACKUP_RC=1
+    report_failure_and_exit "mydumper exited successfully but produced no backup directory."
+  fi
+
+  FILE_COUNT="$(count_files "$BACKUP_DIR")"
+  BACKUP_SIZE="$(total_size "$BACKUP_DIR")"
+  if [[ "$FILE_COUNT" -eq 0 ]]; then
+    FULL_BACKUP_RC=1
+    report_failure_and_exit "mydumper produced an empty backup directory (0 files)."
+  fi
+
+  CHECKSUM="$(compute_manifest_checksum "$BACKUP_DIR")"
+  log "Full backup metadata calculated."
+  log "Backup files: ${FILE_COUNT}, total bytes: ${BACKUP_SIZE}"
+  log "Backup checksum (SHA-256): ${CHECKSUM}"
+  log "Stage: full_backup -> OK"
+
+  # Record the binlog coordinate the dump corresponds to, so a later
+  # incremental resumes EXACTLY from the full snapshot (no gap, no duplicates).
+  # mydumper records this in its `metadata` file: MyDumper v0.21.x writes an
+  # active `[source]` section (SOURCE_LOG_FILE / SOURCE_LOG_POS) when run with
+  # --source-data, and older builds wrote a "SHOW MASTER STATUS:" block. If
+  # binlog is unavailable/disabled, or the anchor is missing/unusable, we still
+  # take the FULL (it is a valid logical baseline) but record an EMPTY anchor so
+  # a later incremental refuses to run rather than mis-resume.
+  set_stage "mysql_binlog_check"
+  if [[ "${BACKUP_BINLOG_ENABLED:-true}" == "true" ]]; then
+    local anchor
+    local anchor_rc=0
+    anchor="$(read_mydumper_binlog_anchor "$BACKUP_DIR")" || anchor_rc=$?
+    if [[ "$anchor_rc" -eq 0 && -n "$anchor" ]]; then
+      BINLOG_FILE_END="${anchor%%$'\t'*}"
+      BINLOG_POSITION_END="${anchor##*$'\t'}"
+      BINLOG_ANCHOR_OK="yes"
+      log "Full backup binlog anchor (from mydumper metadata): ${BINLOG_FILE_END}:${BINLOG_POSITION_END}."
+    else
+      # NOT a failure: the FULL dump is a valid logical baseline on its own. But
+      # without a usable anchor the chain cannot advance by incremental from this
+      # FULL, so the state is written with an EMPTY anchor and any later
+      # incremental refuses to run (rather than mis-resuming from a wrong
+      # position). BINLOG_ANCHOR_OK is surfaced in the exit diagnosis.
+      BINLOG_FILE_END=""
+      BINLOG_POSITION_END=""
+      BINLOG_ANCHOR_OK="no"
+      warn "mydumper metadata did not contain a usable binlog anchor (anchor_rc=${anchor_rc}); this FULL is a valid logical baseline but CANNOT serve as a base for TRUE_INCREMENTAL until a FULL with an anchor is taken."
+    fi
+  else
+    BINLOG_ANCHOR_OK="disabled"
+    log "Binary-log backups disabled (BACKUP_BINLOG_ENABLED=false); no binlog anchor recorded for this full."
+  fi
+}
+
+# ---------------------------------------------------------------------------
+# TRUE INCREMENTAL backup (binary logs only)
+# ---------------------------------------------------------------------------
+run_incremental_backup() {
+  BACKUP_TYPE="incremental"
+  BACKUP_NAME="incremental_$(date -u +"%Y-%m-%d_%H%M%S")"
+  local date_path
+  date_path="$(date -u +"%Y/%m/%d")"
+  # <R2_PATH>/incremental/YYYY/MM/DD/<backup_name>/
+  STORAGE_PATH="${R2_PATH%/}/incremental/${date_path}/${BACKUP_NAME}"
+
+  log "Backup type selected: INCREMENTAL"
+  log "Incremental base full: ${ST_LAST_FULL_NAME} (${ST_LAST_FULL_STORAGE_PATH})."
+
+  # --- Precondition 1: binary logging enabled by config. ---
+  if [[ "${BACKUP_BINLOG_ENABLED:-true}" != "true" ]]; then
+    report_failure_and_exit "Incremental backup is required but binary-log backups are disabled (BACKUP_BINLOG_ENABLED=false). Enable binlog backups or wait for the next full-backup day."
+  fi
+
+  # --- Precondition 2: a valid full base with a binlog anchor exists. ---
+  if [[ "${STATE_PRESENT:-0}" -ne 1 || -z "$ST_LAST_FULL_NAME" ]]; then
+    report_failure_and_exit "Incremental backup is required but no successful full backup base exists."
+  fi
+  if [[ -z "$ST_LAST_BINLOG_FILE" || -z "$ST_LAST_BINLOG_POSITION" ]]; then
+    report_failure_and_exit "Incremental backup base has no recorded binlog position; cannot resume safely. A new full backup is required."
+  fi
+
+  # --- Precondition 3: MySQL binary logging is ON. ---
+  set_stage "mysql_binlog_check"
+  if [[ "${BACKUP_BINLOG_VERIFY:-true}" == "true" ]]; then
+    if ! check_mysql_binlog; then
+      report_failure_and_exit "TRUE incremental backup is impossible: MySQL binary logging is not enabled/usable (log_bin must be ON)."
+    fi
+  fi
+
+  BINLOG_FILE_START="$ST_LAST_BINLOG_FILE"
+  BINLOG_POSITION_START="$ST_LAST_BINLOG_POSITION"
+
+  # Recovery-chain metadata carried in the report payload (never secrets).
+  BASE_BACKUP_NAME="$ST_LAST_FULL_NAME"
+  BASE_FULL_STORAGE_PATH="$ST_LAST_FULL_STORAGE_PATH"
+
+  # --- Precondition 4: the saved start file must still exist (not purged). ---
+  set_stage "binlog_capture"
+  local available_logs
+  available_logs="$(list_binary_logs)"
+  if [[ -z "$available_logs" ]]; then
+    report_failure_and_exit "Could not list MySQL binary logs (SHOW BINARY LOGS returned nothing)."
+  fi
+  if ! printf '%s\n' "$available_logs" | grep -qxF "$BINLOG_FILE_START"; then
+    report_failure_and_exit "The required binary log '${BINLOG_FILE_START}' has already been purged on the server; safe incremental continuation is impossible. A new full backup is required."
+  fi
+
+  # --- Establish the END boundary WITHOUT any table lock. ---
+  # We read the current binlog write position via SHOW BINARY LOG STATUS (MySQL
+  # 8.4+) or SHOW MASTER STATUS (legacy fallback); see acquire_binlog_boundary
+  # for why no FLUSH TABLES WITH READ LOCK is used or needed.
+  local boundary
+  if ! boundary="$(acquire_binlog_boundary)"; then
+    report_failure_and_exit "Could not establish a consistent MySQL binlog boundary (neither SHOW BINARY LOG STATUS nor SHOW MASTER STATUS returned a usable position)."
+  fi
+  BINLOG_FILE_END="${boundary%%$'\t'*}"
+  BINLOG_POSITION_END="${boundary##*$'\t'}"
+  log "Incremental base binlog: ${BINLOG_FILE_START}:${BINLOG_POSITION_START}"
+  log "Incremental end binlog: ${BINLOG_FILE_END}:${BINLOG_POSITION_END}"
+
+  # The end file must be at-or-after the start file (lexical order matches the
+  # binlog.000001, binlog.000002 ... numbering; the numeric suffix is
+  # zero-padded so lexical == numeric for a given prefix).
+  if [[ "$BINLOG_FILE_END" < "$BINLOG_FILE_START" ]]; then
+    report_failure_and_exit "Inconsistent binlog boundary: end file (${BINLOG_FILE_END}) is before start file (${BINLOG_FILE_START})."
+  fi
+
+  # The END file must itself still be retained. If it is already gone the server
+  # rotated and purged past our write point, so the range cannot be captured
+  # completely and the chain is broken.
+  if ! printf '%s\n' "$available_logs" | grep -qxF "$BINLOG_FILE_END"; then
+    report_failure_and_exit "The end boundary binary log '${BINLOG_FILE_END}' is no longer retained by the server, so the range ${BINLOG_FILE_START} -> ${BINLOG_FILE_END} cannot be captured completely. The incremental chain is broken; a new FULL backup is required."
+  fi
+
+  # Build the exact ordered list of binlog files to extract: every retained file
+  # from the start file THROUGH the end file. This correctly handles rotation
+  # (multiple files) and the active file.
+  #
+  # GAP DETECTION: the files we walk MUST be a contiguous run. If the server's
+  # numbering jumps (a file was purged between our start and our end while we
+  # were listing) we abort instead of silently skipping it, because a skipped
+  # file would produce an incremental that APPEARS complete but is missing
+  # events (a silent data-loss bug).
+  local files_to_read=()
+  local seen_start=0 f
+  local expected_next=""
+  while IFS= read -r f; do
+    [[ -z "$f" ]] && continue
+    if [[ "$f" == "$BINLOG_FILE_START" ]]; then
+      seen_start=1
+    fi
+    if [[ "$seen_start" -eq 1 ]]; then
+      # Contiguity check: each file after the first must be exactly the
+      # numerically-next binlog file.
+      if [[ -n "$expected_next" && "$f" != "$expected_next" ]]; then
+        report_failure_and_exit "Binary logs are not contiguous between ${BINLOG_FILE_START} and ${BINLOG_FILE_END}: expected '${expected_next}' next but the server lists '${f}'. A binary log was purged mid-range, so the incremental chain is broken; a new FULL backup is required."
+      fi
+      files_to_read+=("$f")
+      expected_next="$(next_binlog_filename "$f")"
+    fi
+    if [[ "$f" == "$BINLOG_FILE_END" ]]; then
+      break
+    fi
+  done <<< "$available_logs"
+
+  if [[ "${#files_to_read[@]}" -eq 0 ]]; then
+    report_failure_and_exit "No readable binary-log files were found between ${BINLOG_FILE_START} and ${BINLOG_FILE_END}."
+  fi
+
+  # Did we actually reach the end boundary? If the loop ended early (end file
+  # absent from the listing) we must not proceed with a partial range.
+  if [[ "${files_to_read[-1]}" != "$BINLOG_FILE_END" ]]; then
+    report_failure_and_exit "Could not reach the end boundary ${BINLOG_FILE_END} while walking the retained binary logs (stopped at ${files_to_read[-1]}). A binary log in the range is missing; the incremental chain is broken and a new FULL backup is required."
+  fi
+
+  log "Incremental range spans ${#files_to_read[@]} binary log file(s): ${files_to_read[*]}"
+
+  # Fetch a byte-exact copy of each binlog file. The strategy is configurable:
+  #   copy -> read the server's own binlog directory (needs no REPLICATION
+  #           privilege; default)
+  #   raw  -> pull via mysqlbinlog --read-from-remote-server --raw (needs
+  #           REPLICATION SLAVE)
+  # Whichever is used, the package is re-validated locally with mysqlbinlog
+  # below, so a truncated/uneditable copy can never be uploaded silently.
+  rm -rf "$MYSQL_BINLOG_BASE_DIR"
+  mkdir -p "$MYSQL_BINLOG_BASE_DIR"
+  local downloaded_count=0
+  for f in "${files_to_read[@]}"; do
+    local rfile="$MYSQL_BINLOG_BASE_DIR/$f"
+    if ! fetch_binlog_file "$f" "$rfile"; then
+      report_failure_and_exit "Failed to capture binary log '${f}' from the server (strategy: ${BINLOG_FETCH_STRATEGY})."
+    fi
+    downloaded_count=$((downloaded_count + 1))
+  done
+
+  # Package into the incremental archive directory.
+  rm -rf "$BINLOG_DIR"
+  mkdir -p "$BINLOG_DIR"
+
+  # 1) Raw binlog files (the authoritative, byte-exact recovery source).
+  cp -a "$MYSQL_BINLOG_BASE_DIR/." "$BINLOG_DIR/"
+
+  # 2) A validated, human-applicable SQL stream produced by mysqlbinlog, with
+  #    the correct start/stop boundary. This is the artifact operators apply.
+  #
+  # IMPORTANT: mysqlbinlog is invoked with ABSOLUTE paths. The binlog files were
+  # staged into MYSQL_BINLOG_BASE_DIR (a relative directory) and have NOT been
+  # copied into the current working directory. compute_manifest_checksum()
+  # already relies on `cd` being confined to a subshell, so the caller's CWD is
+  # unchanged here; passing the bare file names would make mysqlbinlog look in
+  # the CWD, fail to find the files, and abort every incremental even though the
+  # capture itself succeeded. Resolve the staging directory to an absolute path
+  # once and reference the same bytes that were copied into the archive.
+  local apply_file="$BINLOG_DIR/binlog_apply.sql.gz"
+  local apply_tmp
+  apply_tmp="$(mktemp)"
+  local binlog_abs_dir
+  binlog_abs_dir="$(cd "$MYSQL_BINLOG_BASE_DIR" 2>/dev/null && pwd)" || binlog_abs_dir=""
+  if [[ -z "$binlog_abs_dir" ]]; then
+    rm -f "$apply_tmp"
+    report_failure_and_exit "Internal error: could not resolve the binlog staging directory '${MYSQL_BINLOG_BASE_DIR}'."
+  fi
+  local apply_inputs=()
+  for f in "${files_to_read[@]}"; do
+    apply_inputs+=("${binlog_abs_dir}/${f}")
+  done
+  if ! mysqlbinlog_local_stream "$apply_tmp" "${apply_inputs[@]}"; then
+    rm -f "$apply_tmp"
+    report_failure_and_exit "mysqlbinlog could not validate/extract the binary-log range ${BINLOG_FILE_START}:${BINLOG_POSITION_START} - ${BINLOG_FILE_END}:${BINLOG_POSITION_END}."
+  fi
+  if [[ ! -s "$apply_tmp" ]]; then
+    rm -f "$apply_tmp"
+    report_failure_and_exit "mysqlbinlog produced an empty incremental for ${BINLOG_FILE_START}:${BINLOG_POSITION_START} - ${BINLOG_FILE_END}:${BINLOG_POSITION_END}."
+  fi
+  if ! gzip -c "$apply_tmp" > "$apply_file"; then
+    rm -f "$apply_tmp"
+    report_failure_and_exit "Failed to compress the incremental binlog stream."
+  fi
+  rm -f "$apply_tmp"
+
+  # 3) Machine-readable metadata describing the chain.
+  set_stage "incremental_metadata"
+  write_incremental_metadata "$BINLOG_DIR/backup_metadata.json"
+  log "Stage: incremental_metadata -> OK"
+
+  FILE_COUNT="$(count_files "$BINLOG_DIR")"
+  BACKUP_SIZE="$(total_size "$BINLOG_DIR")"
+  if [[ "$FILE_COUNT" -eq 0 ]]; then
+    report_failure_and_exit "Incremental archive is empty (0 files)."
+  fi
+
+  CHECKSUM="$(compute_manifest_checksum "$BINLOG_DIR")"
+  log "Incremental backup metadata calculated."
+  log "Backup files: ${FILE_COUNT}, total bytes: ${BACKUP_SIZE}"
+  log "Backup checksum (SHA-256): ${CHECKSUM}"
+  log "Stage: binlog_capture -> OK (${downloaded_count} binlog file(s) archived)."
+}
+
+# Compute the numerically-next binlog filename from one we have just seen, so
+# the range walk can prove the listed files are CONTIGUOUS.
+#
+# Binlog names are `binlog.NNNNNN` (zero-padded). If any component is not
+# numeric (e.g. a custom `log_bin_basename` with a different suffix) we cannot
+# compute the successor and return an empty string, which DISABLES the
+# contiguity assertion rather than producing a false failure.
+#
+#   binlog.000070 -> binlog.000071
+next_binlog_filename() {
+  local f="$1"
+  local prefix num width next
+  if [[ ! "$f" =~ ^(.*\.)([0-9]+)$ ]]; then
+    printf ''
+    return 0
+  fi
+  prefix="${BASH_REMATCH[1]}"
+  num="${BASH_REMATCH[2]}"
+  width="${#num}"
+  next=$((10#$num + 1))
+  printf '%s%0*d' "$prefix" "$width" "$next"
+  return 0
+}
+
+# Fetch a byte-exact copy of one binlog file to <dest>.
+#
+# Strategy `raw` (default): `mysqlbinlog --read-from-remote-server --raw`, the
+# standard supported mechanism for a remote binlog consumer.
+# Strategy `copy`: read the file from a locally mounted binlog directory.
+#
+# NOTE on --server-id: a replication client MUST present a server_id that is
+# unique among all other binlog consumers. It comes from MYSQLBINLOG_SERVER_ID
+# (never a hard-coded 1) so it cannot collide with a real replica, with
+# Railway's own binlog archiving, or with a concurrent backup.
+fetch_binlog_file() {
+  local file="$1"
+  local dest="$2"
+  local strategy="${BINLOG_FETCH_STRATEGY:-raw}"
+
+  if [[ "$strategy" == "copy" ]]; then
+    fetch_binlog_file_via_copy "$file" "$dest"
+    return $?
+  fi
+
+  fetch_binlog_file_via_mysqlbinlog "$file" "$dest"
+  return $?
+}
+
+# Read one binlog file straight from a locally mounted binlog directory.
+fetch_binlog_file_via_copy() {
+  local file="$1"
+  local dest="$2"
+
+  if [[ -z "${BINLOG_LOCAL_DIR:-}" ]]; then
+    warn "BINLOG_FETCH_STRATEGY=copy requires BINLOG_LOCAL_DIR to point at the server's binlog directory."
+    return 1
+  fi
+
+  local src="${BINLOG_LOCAL_DIR%/}/${file}"
+  if [[ ! -f "$src" ]]; then
+    warn "Binary log '${file}' was not found under BINLOG_LOCAL_DIR."
+    return 1
+  fi
+  if [[ ! -s "$src" ]]; then
+    warn "Binary log '${file}' is empty."
+    return 1
+  fi
+
+  cp "$src" "$dest"
+  return 0
+}
+
+# Fetch one binlog file with `mysqlbinlog --read-from-remote-server --raw`.
+# Writes the raw bytes into a temp --result-dir, then moves them to <dest>.
+fetch_binlog_file_via_mysqlbinlog() {
+  local file="$1"
+  local dest="$2"
+  local cnf
+  cnf="$(mktemp)"
+  chmod 600 "$cnf"
+  cat > "$cnf" <<EOF
+[client]
+host=${MYSQL_HOST}
+port=${MYSQL_PORT}
+user=${MYSQL_USER}
+password=${MYSQL_PASSWORD}
+EOF
+
+  local outdir
+  outdir="$(mktemp -d)"
+  local rc=0
+  # --raw + -R writes the raw binlog file(s) into --result-dir. --server-id is
+  # required by --raw and comes from MYSQLBINLOG_SERVER_ID (never hard-coded).
+  "$MYSQLBINLOG_BIN" --defaults-extra-file="$cnf" \
+    --read-from-remote-server \
+    --server-id="${MYSQLBINLOG_SERVER_ID}" \
+    --raw \
+    --result-dir "$outdir" \
+    "$file" || rc=$?
+  rm -f "$cnf"
+
+  if [[ "$rc" -ne 0 ]]; then
+    rm -rf "$outdir"
+    return 1
+  fi
+
+  # mysqlbinlog writes the file using the binlog base name. Find it.
+  local produced="" candidate
+  while IFS= read -r candidate; do
+    [[ -n "$candidate" ]] && { produced="$candidate"; break; }
+  done < <(find "$outdir" -type f 2>/dev/null)
+
+  if [[ -z "$produced" || ! -s "$produced" ]]; then
+    rm -rf "$outdir"
+    return 1
+  fi
+
+  cp "$produced" "$dest"
+  rm -rf "$outdir"
+  return 0
+}
+
+# Re-read the locally captured binlog files with mysqlbinlog and verify the
+# requested range is present and produces at least one event. This is the
+# VALIDATION step that stops a truncated/unreadable capture from being uploaded,
+# and it is also what produces the human-applicable SQL stream.
+#
+# The command fails (non-zero) when the capture is unusable, so a failed
+# capture is a hard failure and state is never advanced for it.
+#
+#   mysqlbinlog_local_stream <outfile> <file1> <file2> ...
+#
+# POSITION SEMANTICS: mysqlbinlog applies --start-position to the FIRST file and
+# --stop-position to the LAST file in the list. That is exactly what the
+# persisted state + the acquired end boundary mean for a multi-file (rotated)
+# range, so no position translation is needed.
+mysqlbinlog_local_stream() {
+  local outfile="$1"
+  shift
+  local files=("$@")
+
+  "$MYSQLBINLOG_BIN" \
+    --start-position="${BINLOG_POSITION_START}" \
+    --stop-position="${BINLOG_POSITION_END}" \
+    "${files[@]}" > "$outfile"
+}
+
+# Write the incremental metadata JSON into the archive.
+write_incremental_metadata() {
+  local dest="$1"
+  {
+    printf '{\n'
+    printf '  "backup_type": "incremental",\n'
+    printf '  "backup_name": "%s",\n' "$(json_escape "$BACKUP_NAME")"
+    printf '  "base_full_backup_name": "%s",\n' "$(json_escape "$ST_LAST_FULL_NAME")"
+    printf '  "base_full_storage_path": "%s",\n' "$(json_escape "$ST_LAST_FULL_STORAGE_PATH")"
+    printf '  "start_binlog_file": "%s",\n' "$(json_escape "$BINLOG_FILE_START")"
+    printf '  "start_binlog_position": %s,\n' "${BINLOG_POSITION_START:-0}"
+    printf '  "end_binlog_file": "%s",\n' "$(json_escape "$BINLOG_FILE_END")"
+    printf '  "end_binlog_position": %s,\n' "${BINLOG_POSITION_END:-0}"
+    printf '  "started_at": "%s",\n' "$(json_escape "$STARTED_AT")"
+    printf '  "completed_at": "%s"\n' "$(json_escape "$(now_utc)")"
+    printf '}\n'
+  } > "$dest"
+}
+
+# ---------------------------------------------------------------------------
+# Shared upload + verify (used by both FULL and INCREMENTAL)
+# ---------------------------------------------------------------------------
+# Configures rclone, uploads <local_dir> to <storage_path>, and verifies it.
+configure_rclone() {
+  set_stage "rclone_config"
+  log "Stage: rclone_config (started) -> ${RCLONE_CONFIG}"
+  mkdir -p "$RCLONE_CONFIG_DIR"
+  # The config file holds the R2 access key id and SECRET access key, so create
+  # it with owner-only permissions. `umask 077` guarantees the redirect below
+  # creates the file mode 600 (a plain `> file` under the default umask would be
+  # world-readable, leaking the R2 credentials to any process in the container).
+  (
+    umask 077
+    {
+      printf '[remote]\n'
+      printf 'type = s3\n'
+      printf 'provider = %s\n' "$R2_PROVIDER"
+      printf 'access_key_id = %s\n' "$R2_ACCESS_KEY_ID"
+      printf 'secret_access_key = %s\n' "$R2_SECRET_ACCESS_KEY"
+      printf 'endpoint = %s\n' "$R2_ENDPOINT"
+      # Omitted entirely when R2_ACL is empty; some S3-compatible endpoints
+      # reject canned ACLs and would otherwise fail every upload.
+      if [[ -n "${R2_ACL:-}" ]]; then
+        printf 'acl = %s\n' "$R2_ACL"
+      fi
+    } > "$RCLONE_CONFIG"
+  )
+  # Belt-and-braces in case the file already existed with looser permissions.
+  chmod 600 "$RCLONE_CONFIG" 2>/dev/null || true
+  log "Stage: rclone_config -> written"
+
+  if ! rclone --config "$RCLONE_CONFIG" listremotes >/dev/null 2>&1; then
+    report_failure_and_exit "rclone configuration could not be read/validated (config: ${RCLONE_CONFIG})."
+  fi
+  if ! rclone --config "$RCLONE_CONFIG" listremotes 2>/dev/null | grep -q '^remote:$'; then
+    report_failure_and_exit "rclone configuration is missing the [remote] destination."
+  fi
+  log "Stage: rclone_config -> validated ([remote] present)"
+}
+
+upload_and_verify() {
+  local dir="$1"
+
+  configure_rclone
+
+  set_stage "rclone_upload"
+  log "Stage: rclone_upload (started) -> remote:${R2_BUCKET}/${STORAGE_PATH}"
+  if ! rclone --config "$RCLONE_CONFIG" sync "$dir" "remote:${R2_BUCKET}/${STORAGE_PATH}"; then
+    UPLOAD_RC=1
+    report_failure_and_exit "rclone upload to Cloudflare R2 failed."
+  fi
+  UPLOAD_RC=0
+  log "Stage: rclone_upload -> OK"
+
+  set_stage "rclone_verify"
+  log "Stage: rclone_verify (started)"
+  if ! verify_upload "$dir" "${R2_BUCKET}/${STORAGE_PATH}"; then
+    VERIFY_RC=1
+    report_failure_and_exit "R2 upload verification failed."
+  fi
+  VERIFY_RC=0
+  log "Stage: rclone_verify -> OK"
 }
 
 # ---------------------------------------------------------------------------
@@ -426,117 +1858,173 @@ main() {
 
   set_stage "init"
   STARTED_AT="$(now_utc)"
-  BACKUP_NAME="daily_snapshot_$(date -u +"%Y-%m-%d_%H%M%S")"
 
-  # Unique destination: <R2_PATH>/daily_snapshot/YYYY/MM/DD/<backup_name>/
-  DATE_PATH="$(date -u +"%Y/%m/%d")"
-  STORAGE_PATH="${R2_PATH%/}/daily_snapshot/${DATE_PATH}/${BACKUP_NAME}"
+  # rclone must be configured BEFORE the lock can be taken, because the lock is
+  # itself an object in R2. A failure here is fatal: without a working rclone we
+  # can neither back up nor report anything meaningful.
+  configure_rclone
 
-  log "Starting ${BACKUP_TYPE} backup: ${BACKUP_NAME}"
-  log "R2 destination: ${R2_BUCKET}/${STORAGE_PATH}"
-
-  # 1) Logical dump with mydumper into a fresh local directory.
-  set_stage "mydumper"
-  log "Stage: mydumper (started)"
-  rm -rf "$BACKUP_DIR"
-  if ! mydumper \
-    --host "$MYSQL_HOST" \
-    --user "$MYSQL_USER" \
-    --password "$MYSQL_PASSWORD" \
-    --port "$MYSQL_PORT" \
-    --database "$MYSQL_DATABASE" \
-    -C -c --clear -o "$BACKUP_DIR"; then
-    report_failure_and_exit "mydumper failed to produce a logical database snapshot."
+  # --- Acquire the distributed lock BEFORE reading/modifying the chain state. --
+  # Two concurrent runs must never read the same state, capture overlapping
+  # binlog ranges, and then both advance the state.
+  set_stage "lock_acquire"
+  log "Stage: lock_acquire"
+  if ! acquire_lock; then
+    warn "Another backup run currently holds the distributed lock (remote:${BACKUP_LOCK_REMOTE})."
+    warn "Exiting without touching the backup chain; the next scheduled run will retry."
+    exit "$EXIT_LOCK_HELD"
   fi
-  log "Stage: mydumper -> OK"
+  # Release the lock on ANY exit path (success, failure, or unexpected signal).
+  trap cleanup_on_exit EXIT
+  log "Stage: lock_acquire -> OK"
 
-  set_stage "metadata"
-  log "Stage: metadata (started)"
-  if [[ ! -d "$BACKUP_DIR" ]]; then
-    report_failure_and_exit "mydumper exited successfully but produced no backup directory."
+  # Load the persisted policy state from R2 BEFORE deciding the backup type.
+  set_stage "backup_state"
+  log "Stage: backup_state (started)"
+  load_state
+  log "Stage: backup_state -> OK"
+
+  # Decide: FULL or INCREMENTAL. There is NO path that runs both in one run.
+  set_stage "backup_type_detection"
+  log "Stage: backup_type_detection"
+  determine_backup_type
+  local decided_type="$DECIDED_TYPE"
+  log "Stage: backup_type_detection -> ${decided_type}"
+
+  if [[ "$decided_type" == "full" ]]; then
+    log "Incremental backup skipped because today is a full-backup day."
+    run_full_backup
+    FULL_BACKUP_RC=0
+    report_stage_rc "full_backup" "$FULL_BACKUP_RC"
+
+    upload_and_verify "$BACKUP_DIR"
+
+    COMPLETED_AT="$(now_utc)"
+    VERIFIED_AT="$(now_utc)"
+
+    set_stage "report_success"
+    log "Stage: report_success (started)"
+    # Capture the report's own return code so the exit diagnosis can distinguish
+    # "the report was rejected" from "the report could not be delivered".
+    local success_report_rc=0
+    report_now "success" || success_report_rc=$?
+    REPORT_RC="$success_report_rc"
+    report_stage_rc "report_success" "$REPORT_RC"
+    if [[ "$REPORT_RC" -ne 0 ]]; then
+      # The backup EXISTS and is uploaded/verified; only the report failed, so
+      # we must NOT mark the backup failed and must NOT delete it (it can be
+      # reconciled later). State is NOT advanced, so the next run repeats a FULL
+      # rather than resuming from an unreported base.
+      warn "Backup succeeded and was verified, but PUPTracker reporting failed; the backup is retained for reconciliation."
+      if [[ "${REPORT_CONFLICT:-0}" -eq 1 ]]; then
+        log_exit_diagnosis "failed" "report conflict (HTTP 409); backup retained, state not advanced"
+        exit "$EXIT_REPORT_CONFLICT"
+      fi
+      log_exit_diagnosis "failed" "success report not accepted (rc=${REPORT_RC}); backup retained, state not advanced"
+      exit "$EXIT_REPORT_FAILED"
+    fi
+    log "Stage: report_success -> OK"
+
+    # ONLY NOW advance state: this full becomes the new base, and it also resets
+    # the incremental binlog anchor to this full's consistent boundary. If the
+    # full had no binlog anchor (binlog disabled) the anchor is stored empty so
+    # a later incremental cannot mis-resume.
+    set_stage "state_update"
+    if ! lock_still_owned; then
+      warn "Refusing to persist state: this run no longer owns the backup lock."
+      log_exit_diagnosis "failed" "backup lock lost before state update"
+      exit 1
+    fi
+    local state_rc=0
+    update_state \
+      "$BACKUP_NAME" \
+      "$COMPLETED_AT" \
+      "$STORAGE_PATH" \
+      "${BINLOG_FILE_END:-}" \
+      "${BINLOG_POSITION_END:-0}" \
+      "${BINLOG_FILE_END:-}" \
+      "${BINLOG_POSITION_END:-0}" || state_rc=$?
+    STATE_UPDATE_RC="$state_rc"
+    report_stage_rc "state_update" "$STATE_UPDATE_RC"
+    if [[ "$STATE_UPDATE_RC" -ne 0 ]]; then
+      # The backup is uploaded, verified and reported, but the chain bookkeeping
+      # is now untrustworthy: operators cannot know which FULL is the base.
+      warn "Backup state could not be persisted; the backup chain bookkeeping is not trustworthy."
+      warn "The uploaded backup was retained. The next run will detect the state problem and recover safely (by taking a new FULL)."
+      log_exit_diagnosis "failed" "backup_state.json could not be persisted"
+      exit 1
+    fi
+
+    set_stage "done"
+    log "Backup completed (FULL) and reported to PUPTracker."
+    exit 0
   fi
 
-  FILE_COUNT="$(count_files)"
-  BACKUP_SIZE="$(total_size)"
-  if [[ "$FILE_COUNT" -eq 0 ]]; then
-    report_failure_and_exit "mydumper produced an empty backup directory (0 files)."
-  fi
+  # --- INCREMENTAL branch. ---
+  log "Full backup not due."
 
-  CHECKSUM="$(compute_manifest_checksum)"
-  VERIFIED_AT="$(now_utc)"
+  # The state anchor files: the binlog boundary values used for THIS run come
+  # from the loaded state (start) and the acquired boundary (end). On success we
+  # advance ONLY the binlog boundary; the full base is unchanged.
+  run_incremental_backup
+  report_stage_rc "incremental_backup" 0
 
-  log "Backup metadata calculated."
-  log "Backup files: ${FILE_COUNT}, total bytes: ${BACKUP_SIZE}"
-  log "Backup checksum (SHA-256): ${CHECKSUM}"
-  log "Stage: metadata -> OK"
-
-  # 3) Configure rclone (existing behavior preserved, hardened):
-  #    - mkdir -p the config directory FIRST so the write can never fail.
-  #    - write an explicit, deterministic config file.
-  #    - validate it by listing remotes with --config before uploading.
-  set_stage "rclone_config"
-  log "Stage: rclone_config (started) -> ${RCLONE_CONFIG}"
-  mkdir -p "$RCLONE_CONFIG_DIR"
-  cat > "$RCLONE_CONFIG" <<EOF
-[remote]
-type = s3
-provider = Cloudflare
-access_key_id = $R2_ACCESS_KEY_ID
-secret_access_key = $R2_SECRET_ACCESS_KEY
-endpoint = $R2_ENDPOINT
-acl = private
-EOF
-  log "Stage: rclone_config -> written"
-
-  # Validate the config parses and exposes the [remote] before we attempt an
-  # upload. Fail fast with a clear (non-secret) diagnostic if it does not.
-  if ! rclone --config "$RCLONE_CONFIG" listremotes >/dev/null 2>&1; then
-    report_failure_and_exit "rclone configuration could not be read/validated (config: ${RCLONE_CONFIG})."
-  fi
-  if ! rclone --config "$RCLONE_CONFIG" listremotes 2>/dev/null | grep -q '^remote:$'; then
-    report_failure_and_exit "rclone configuration is missing the [remote] destination."
-  fi
-  log "Stage: rclone_config -> validated ([remote] present)"
-
-  # 4) Upload to the unique destination.
-  set_stage "rclone_upload"
-  log "Stage: rclone_upload (started) -> remote:${R2_BUCKET}/${STORAGE_PATH}"
-  if ! rclone --config "$RCLONE_CONFIG" sync "$BACKUP_DIR" "remote:${R2_BUCKET}/${STORAGE_PATH}"; then
-    report_failure_and_exit "rclone upload to Cloudflare R2 failed."
-  fi
-  log "Stage: rclone_upload -> OK"
-
-  # 5) Verify the upload (do not report success on local success alone).
-  set_stage "rclone_verify"
-  log "Stage: rclone_verify (started)"
-  if ! verify_upload; then
-    report_failure_and_exit "R2 upload verification failed."
-  fi
-  log "Stage: rclone_verify -> OK"
+  upload_and_verify "$BINLOG_DIR"
 
   COMPLETED_AT="$(now_utc)"
+  VERIFIED_AT="$(now_utc)"
 
-  log "Backup uploaded and verified successfully: ${BACKUP_NAME}"
-
-  # 6) Report success.
   set_stage "report_success"
   log "Stage: report_success (started)"
-  if ! report_now "success"; then
-    # The backup itself succeeded and is safe in R2. Only the report failed.
-    # Do NOT change the backup's status to failed. Log clearly and exit
-    # non-zero so Railway surfaces the reporting problem. A later retry with the
-    # same backup_name is safe (PUPTracker is idempotent by backup_name).
-    warn "Backup succeeded but PUPTracker reporting failed."
-    exit 3
+  local inc_report_rc=0
+  report_now "success" || inc_report_rc=$?
+  REPORT_RC="$inc_report_rc"
+  report_stage_rc "report_success" "$REPORT_RC"
+  if [[ "$REPORT_RC" -ne 0 ]]; then
+    warn "Backup succeeded and was verified, but PUPTracker reporting failed; the backup is retained for reconciliation."
+    if [[ "${REPORT_CONFLICT:-0}" -eq 1 ]]; then
+      log_exit_diagnosis "failed" "report conflict (HTTP 409); backup retained, state not advanced"
+      exit "$EXIT_REPORT_CONFLICT"
+    fi
+    log_exit_diagnosis "failed" "success report not accepted (rc=${REPORT_RC}); backup retained, state not advanced"
+    exit "$EXIT_REPORT_FAILED"
   fi
   log "Stage: report_success -> OK"
 
+  # Advance ONLY the binlog boundary. The full base is carried forward verbatim.
+  set_stage "state_update"
+  if ! lock_still_owned; then
+    warn "Refusing to persist state: this run no longer owns the backup lock."
+    log_exit_diagnosis "failed" "backup lock lost before state update"
+    exit 1
+  fi
+  local inc_state_rc=0
+  update_state \
+    "$ST_LAST_FULL_NAME" \
+    "$ST_LAST_FULL_COMPLETED_AT" \
+    "$ST_LAST_FULL_STORAGE_PATH" \
+    "$BINLOG_FILE_END" \
+    "$BINLOG_POSITION_END" \
+    "$BINLOG_FILE_END" \
+    "$BINLOG_POSITION_END" || inc_state_rc=$?
+  STATE_UPDATE_RC="$inc_state_rc"
+  report_stage_rc "state_update" "$STATE_UPDATE_RC"
+  if [[ "$STATE_UPDATE_RC" -ne 0 ]]; then
+    warn "Backup state could not be persisted; the incremental chain position is not trustworthy."
+    warn "The uploaded incremental was retained. The next run will detect the state problem and re-capture from the last known-good position."
+    log_exit_diagnosis "failed" "backup_state.json could not be persisted (incremental)"
+    exit 1
+  fi
+
   set_stage "done"
-  log "Backup completed and reported to PUPTracker."
+  log "Backup completed (INCREMENTAL) and reported to PUPTracker."
   exit 0
 }
 
 # Run main() only when executed directly (not when sourced for testing).
-if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+# See the BACKUP_SOURCED note near the top: `BASH_SOURCE[0] == $0` alone is not
+# sufficient because `bash -c 'source "$0" ...' <file>` also satisfies it, so an
+# explicit opt-out is honoured here too.
+if [[ "${BASH_SOURCE[0]}" == "$0" && "${BACKUP_SOURCED:-0}" != "1" ]]; then
   main "$@"
 fi
