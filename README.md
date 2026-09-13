@@ -40,7 +40,7 @@ days**, a **TRUE binlog incremental on every other run**):
 | Any other day   | MySQL **binary-log** archive since the last recorded position | `incremental` |
 
 The decision is made from the state object stored in R2
-(`<R2_PATH>/state/backup_state.json`), which records only the most recent
+(`<R2_BUCKET>/<R2_PATH>/state/backup_state.json`), which records only the most recent
 **successful, verified, reported and persisted** FULL:
 
 - **No valid FULL base at all** → the run is a **FULL**.
@@ -132,6 +132,72 @@ state) and an **end** (read from the server at capture time).
   locally with `mysqlbinlog` before upload, so a truncated capture cannot be
   uploaded as if valid, and the saved position only moves after the whole chain
   (upload → verify → report → persist) succeeds.
+
+### MySQL 8.4: how the FULL anchor is obtained
+
+MySQL **8.4 removed `SHOW MASTER STATUS`** in favour of `SHOW BINARY LOG STATUS`.
+That makes the snapshot anchor dependent on *which statement the dumper issues*,
+and the pinned `mydumper/mydumper:v0.21.3-2` picks between them by classifying
+the server from `@@version_comment` / `@@version`:
+
+- If the classification succeeds (the text contains `mysql`, `percona`,
+  `mariadb`, `tidb`, `dolt` or `google`), mydumper recognises 8.4 and uses
+  `SHOW BINARY LOG STATUS`.
+- If **no** product token matches (e.g. a distro build reporting
+  `@@version_comment = (Ubuntu)`), it falls back to the removed
+  `SHOW MASTER STATUS`, gets
+  `ERROR 1064 ... near 'MASTER STATUS'`, logs
+  `Couldn't get master position`, and writes its `metadata` file with **no
+  `[source]` section at all** — so the FULL records **no anchor** and every later
+  incremental correctly refuses to run.
+
+The container therefore passes mydumper an explicit
+`--server-version <product>-<major>.<minor>.<patch>`, **derived from the live
+server** rather than hard-coded:
+
+1. If `@@version_comment`/`@@version` contains a known product token, that product
+   is used with the server's own `major.minor.patch`.
+2. Otherwise the server is probed **behaviourally**: only MySQL 8.4+ answers
+   `SHOW BINARY LOG STATUS`, so a successful probe confirms the MySQL family
+   without guessing from strings.
+3. If neither establishes the server family, no override is passed and mydumper
+   auto-detects exactly as before.
+
+Because the value comes from the server, it keeps working across upgrades and for
+MariaDB/Percona builds instead of pinning one vendor's version into the image.
+
+> **This only changes which statement mydumper uses to read the coordinate.** It
+> cannot invent an anchor: if the position is still unavailable, no `[source]`
+> section is written and the safety rule applies unchanged (empty anchor ⇒
+> incremental refuses to run).
+
+The `raw` capture path likewise uses the **MySQL** client's portable form. The
+`--result-dir` option is *MariaDB-only* — MySQL's `mysqlbinlog` rejects it with
+`unknown option '--result-dir'` — so the container runs `mysqlbinlog` with the
+destination directory as its working directory and lets it create a file named
+after the binlog.
+
+### Diagnosing a missing anchor
+
+When an anchor cannot be read, the log shows exactly why (never a secret):
+
+```text
+[backup] mydumper version: mydumper v0.21.3-2, built against MySQL 8.4.8 ...
+[backup] mydumper server-version override: mysql-8.4.10
+[backup] mydumper command: mydumper --defaults-file=/tmp/tmp.XXXX --host ... --source-data --server-version mysql-8.4.10 -C -c --clear -o backup
+...
+[backup] DIAG anchor: mydumper_version='mydumper v0.21.3-2, ...'
+[backup] DIAG anchor: metadata_path='backup/metadata' exists=yes
+[backup] DIAG anchor: source_section_present=no
+[backup] DIAG anchor: parsed_SOURCE_LOG_FILE='<none>' parsed_SOURCE_LOG_POS='<none>'
+[backup] DIAG anchor: active_metadata_keys=[config] quote-character=BACKTICK
+[backup] DIAG mysql: version='8.4.10-...' version_comment='(Ubuntu)' log_bin='1' binlog_format='ROW'
+[backup] DIAG mysql: gtid_mode='OFF'
+```
+
+`source_section_present=no` points at the **server-side** statement (a dumper
+version/classification problem); `yes` with an empty `parsed_*` points at the
+**parser**. The override line shows whether a `--server-version` was derived.
 
 ### Environment variables (backup policy)
 
@@ -233,7 +299,7 @@ non-zero, no backup taken) if either is missing:
 When reporting is configured, the container:
 
 1. Loads the backup policy state from R2
-   (`<R2_PATH>/state/backup_state.json`).
+   (`<R2_BUCKET>/<R2_PATH>/state/backup_state.json`).
 2. Decides FULL vs INCREMENTAL from the most recent **successful, verified**
    FULL (never from a merely-attempted FULL).
 3. Produces the backup:

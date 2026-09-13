@@ -119,6 +119,33 @@ RUN set -eux; \
       exit 1; \
     fi; \
     \
+    # `--server-version` is what makes the anchor obtainable ON MySQL 8.4+: it
+    # lets the entrypoint declare the server family/version so mydumper issues
+    # `SHOW BINARY LOG STATUS` instead of the statement MySQL 8.4 REMOVED
+    # (`SHOW MASTER STATUS`). Without the flag the entrypoint cannot derive an
+    # override and a token-less `@@version_comment` (e.g. `(Ubuntu)`) yields no
+    # anchor at all. Fail the build rather than ship an image with no remedy.
+    if ! mydumper --help 2>&1 | grep -q -- '--server-version'; then \
+      echo "BUILD FAILURE: this mydumper does not support --server-version; the FULL backup could not obtain a binlog anchor on MySQL 8.4+." >&2; \
+      mydumper --version >&2 || true; \
+      exit 1; \
+    fi; \
+    \
+    # The mysqlbinlog client must be the MySQL (not MariaDB) one, and it must
+    # NOT be expected to accept --result-dir (a MariaDB-only option). Assert the
+    # MySQL client's own `--result-file` long form so a MariaDB client slipping
+    # in is caught here instead of at 03:00 during an incremental.
+    if ! mysqlbinlog --help 2>&1 | grep -q -- '--result-file'; then \
+      echo "BUILD FAILURE: mysqlbinlog does not support --result-file; is this the MySQL client?" >&2; \
+      mysqlbinlog --version >&2 || true; \
+      exit 1; \
+    fi; \
+    if mysqlbinlog --help 2>&1 | grep -q -- '--result-dir'; then \
+      echo "BUILD FAILURE: mysqlbinlog advertises --result-dir, which means it is a MariaDB client; the entrypoint uses the MySQL form." >&2; \
+      mysqlbinlog --version >&2 || true; \
+      exit 1; \
+    fi; \
+    \
     # Record the resolved versions so an image can be audited against the server
     # it will back up (the binlog tooling must not be older than the server's
     # binlog format expectations).

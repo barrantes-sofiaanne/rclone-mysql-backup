@@ -160,7 +160,12 @@ MYSQLBINLOG_SERVER_ID="${MYSQLBINLOG_SERVER_ID:-2147483000}"
 # taken over, so a crash can NEVER permanently block future backups.
 BACKUP_LOCK_ENABLED="${BACKUP_LOCK_ENABLED:-true}"
 BACKUP_LOCK_TTL_SECONDS="${BACKUP_LOCK_TTL_SECONDS:-21600}"  # 6h
-BACKUP_LOCK_REMOTE="${R2_PATH%/}/state/backup.lock"
+# The object path MUST include the bucket. An rclone remote path is
+# `remote:<bucket>/<key>`, so a path built from R2_PATH alone would place the
+# lock in a DIFFERENT bucket than the backups it is supposed to protect. This is
+# the same `<bucket>/<path>` composition the backup UPLOAD paths use (see
+# upload_and_verify), so state, lock and backups always resolve to one bucket.
+BACKUP_LOCK_REMOTE="${R2_BUCKET}/${R2_PATH%/}/state/backup.lock"
 BACKUP_LOCK_HELD=0
 BACKUP_LOCK_TOKEN=""
 
@@ -216,7 +221,9 @@ MYSQL_CLIENT_BIN="${MYSQL_CLIENT_BIN:-mysql}"
 # Result of the binlog_format probe (ROW | STATEMENT | MIXED).
 BINLOG_FORMAT_PROBED=""
 # Remote (R2) path of the small JSON state object that drives the policy.
-BACKUP_STATE_REMOTE="${R2_PATH%/}/state/backup_state.json"
+# Bucket-qualified for the same reason as BACKUP_LOCK_REMOTE above: this object
+# must live beside the backups it describes, in the SAME bucket.
+BACKUP_STATE_REMOTE="${R2_BUCKET}/${R2_PATH%/}/state/backup_state.json"
 
 # ---------------------------------------------------------------------------
 # rclone config location
@@ -818,7 +825,11 @@ report_failure_and_exit() {
 # ---------------------------------------------------------------------------
 # The container has NO direct access to the PUPTracker database, so backup
 # state is persisted as a small JSON object in R2 at:
-#     <R2_PATH>/state/backup_state.json
+#     <R2_BUCKET>/<R2_PATH>/state/backup_state.json
+#
+# The bucket component is REQUIRED. rclone addresses an object as
+# `remote:<bucket>/<key>`, so omitting the bucket silently retargets the state
+# object into a different bucket than the backups it tracks.
 #
 # It records the latest SUCCESSFUL, VERIFIED full backup and the incremental
 # binlog boundary. It is ONLY advanced after a run has: completed, uploaded,
@@ -1361,6 +1372,125 @@ list_binary_logs() {
   mysql_query "SHOW BINARY LOGS;" | awk -F'\t' 'NF>=2 {print $1}'
 }
 
+# Returns 0 when the server implements the MySQL 8.4 `SHOW BINARY LOG STATUS`
+# statement, which is a BEHAVIOURAL confirmation of the server family.
+#
+# WHY THIS EXISTS: mydumper classifies the server purely by matching
+# `@@version_comment`/`@@version` against a token list, and that fails on real
+# 8.4 servers whose comment is a distro string (e.g. `(Ubuntu)` or `(Debian)`)
+# with no product token. Rather than GUESSING from more strings, we ask the
+# server which statement it actually accepts: only MySQL 8.4+ answers
+# `SHOW BINARY LOG STATUS`, and pre-8.4/other families error on it.
+mysql_supports_binary_log_status() {
+  command -v "$MYSQL_CLIENT_BIN" >/dev/null 2>&1 || return 1
+  local out
+  out="$(mysql_query "SHOW BINARY LOG STATUS;")"
+  [[ -n "$out" ]]
+}
+
+# Derive the mydumper product-version override, in mydumper's own
+# `<product>-<major>.<minor>.<patch>` form (e.g. `mysql-8.4.11`).
+#
+# WHY THIS IS REQUIRED — the root cause of "no binlog anchor" on MySQL 8.4:
+#
+# mydumper chooses which statement to use for the snapshot binlog coordinate in
+# server_detect.c:detect_replica(). It starts from the PRE-8.4 default
+#
+#     show_binary_log_status = SHOW MASTER STATUS
+#
+# and upgrades it to `SHOW BINARY LOG STATUS` only inside a switch whose case arm
+# is guarded by `get_major()>=8 && (get_secondary()>0 || revision>=22)`.
+#
+# The product and version come from detect_server_version(), which issues
+#     SELECT @@version_comment, @@version
+# and matches the LOWERCASED text of BOTH columns against
+# percona|mariadb|tidb|dolt|google|mysql|source. If NOTHING matches, the product
+# stays SERVER_TYPE_UNKNOWN and the version is parsed from the literal "0.0.0",
+# so major=0. The upgrade branch is therefore skipped, `SHOW MASTER STATUS` is
+# issued, and MySQL 8.4 rejects it:
+#     Couldn't get master position - ERROR 1064 ... near 'MASTER STATUS'
+# mydumper then writes its metadata file WITHOUT any `[source]` section, so the
+# FULL records no anchor and every subsequent incremental must refuse to run.
+# (Reproduced against a MySQL 8.4 server whose @@version_comment hides the
+# "mysql" substring.)
+#
+# `--server-version` makes server_detect() bypass detection entirely and take the
+# product+version verbatim, so the correct 8.4 statement is selected and the
+# anchor is written. The value is DERIVED from the live server — never
+# hard-coded — so it stays correct across upgrades and for MariaDB/Percona/RDS
+# builds rather than pinning one vendor's version into the image.
+#
+# SAFETY: this only changes WHICH statement mydumper uses to read the snapshot
+# coordinate. It cannot invent an anchor: if the position is still unavailable,
+# mydumper writes no `[source]` section and the existing rule applies (empty
+# anchor -> incremental refuses to run).
+#
+# Prints the override, or nothing when the server could not be classified (the
+# caller then passes no override and behaviour is exactly as before).
+detect_mydumper_server_version() {
+  # Never hard-require the client: when binlog support is disabled the MySQL
+  # client may legitimately be absent, and that must not break a FULL.
+  command -v "$MYSQL_CLIENT_BIN" >/dev/null 2>&1 || return 1
+
+  local raw version comment haystack product="" ver3
+  raw="$(mysql_query "SELECT @@version, @@version_comment;")"
+  version="$(printf '%s' "$raw" | awk -F'\t' '{print $1}' | head -n1)"
+  comment="$(printf '%s' "$raw" | awk -F'\t' '{print $2}' | head -n1)"
+  [[ -n "$version" ]] || return 1
+
+  # First three numeric version components, so both `8.4.11` and distro-suffixed
+  # forms such as `8.4.10-0ubuntu0.26.04.1` / `8.4.11-1.el9` reduce correctly.
+  ver3="$(printf '%s' "$version" | sed -n -E 's/^([0-9]+)\.([0-9]+)\.([0-9]+).*/\1.\2.\3/p')"
+  [[ -n "$ver3" ]] || return 1
+
+  # Mirror mydumper's own precedence ordering exactly, so the product we declare
+  # matches what its own detection would have concluded.
+  haystack="$(printf '%s %s' "$version" "$comment" | tr '[:upper:]' '[:lower:]')"
+  case "$haystack" in
+    *percona*)        product="percona" ;;
+    *mariadb*)        product="mariadb" ;;
+    *tidb*)           product="tidb" ;;
+    *dolt*)           product="dolt" ;;
+    *google*)         product="google" ;;
+    *mysql*|*source*) product="mysql" ;;
+  esac
+
+  # No product token matched. mydumper would fall back to its pre-8.4 statement
+  # here, so we must still produce an override when the server really is a modern
+  # MySQL -- otherwise the anchor is silently unavailable (the reported bug).
+  # Confirm that BEHAVIOURALLY rather than guessing from another string: only
+  # MySQL 8.4+ implements `SHOW BINARY LOG STATUS`. A server that fails the probe
+  # yields no override, exactly as before.
+  if [[ -z "$product" ]]; then
+    if mysql_supports_binary_log_status; then
+      product="mysql"
+    fi
+  fi
+
+  [[ -n "$product" ]] || return 1
+
+  printf '%s-%s' "$product" "$ver3"
+  return 0
+}
+
+# Emit non-secret evidence about the MySQL server's binary-logging capability.
+# Used both when the anchor is missing and as a record on every FULL, so an
+# operator can see the preconditions the anchor depends on.
+log_mysql_binlog_diagnostics() {
+  local raw version comment log_bin fmt gtid
+  raw="$(mysql_query "SELECT @@version, @@version_comment, @@log_bin, @@binlog_format;" 2>/dev/null || true)"
+  version="$(printf '%s' "$raw" | awk -F'\t' '{print $1}' | head -n1)"
+  comment="$(printf '%s' "$raw" | awk -F'\t' '{print $2}' | head -n1)"
+  log_bin="$(printf '%s' "$raw" | awk -F'\t' '{print $3}' | head -n1)"
+  fmt="$(printf '%s' "$raw" | awk -F'\t' '{print $4}' | head -n1)"
+  log "DIAG mysql: version='${version:-<unknown>}' version_comment='${comment:-<unknown>}' log_bin='${log_bin:-<unknown>}' binlog_format='${fmt:-<unknown>}'"
+
+  # GTID mode decides whether a GTID coordinate is also available; it is
+  # informational here because this chain resumes by file+position.
+  gtid="$(mysql_query "SELECT @@gtid_mode;" 2>/dev/null | head -n1 || true)"
+  log "DIAG mysql: gtid_mode='${gtid:-<unknown>}'"
+}
+
 # ---------------------------------------------------------------------------
 # FULL backup (existing MyDumper flow, preserved)
 # ---------------------------------------------------------------------------
@@ -1412,6 +1542,21 @@ EOF
   # recorded here describe the exact instant the snapshot was taken, which is
   # what makes the FULL -> INCREMENTAL chain gap-free.
   #
+  # --server-version is DERIVED FROM THE LIVE SERVER (see
+  # detect_mydumper_server_version) so mydumper selects the MySQL 8.4
+  # `SHOW BINARY LOG STATUS` statement instead of the removed
+  # `SHOW MASTER STATUS`. It is passed ONLY when the server could be classified;
+  # otherwise the option is omitted entirely so behaviour is byte-for-byte the
+  # same as before on any server we cannot identify.
+  local mydumper_sv=""
+  mydumper_sv="$(detect_mydumper_server_version || true)"
+  local -a sv_args=()
+  if [[ -n "$mydumper_sv" ]]; then
+    sv_args=(--server-version "$mydumper_sv")
+    log "mydumper server-version override: ${mydumper_sv}"
+  else
+    warn "Could not classify the MySQL server for mydumper; running without --server-version (the binlog anchor may be unavailable on MySQL 8.4+)."
+  fi
   # The version is logged because the binlog-anchor handshake with the server is
   # version-sensitive: a build that falls back to the pre-8.4 `SHOW MASTER STATUS`
   # statement cannot read a position from a MySQL 8.4+ server at all.
@@ -1426,6 +1571,7 @@ EOF
         --port "$MYSQL_PORT" \
         --database "$MYSQL_DATABASE" \
         --source-data \
+        "${sv_args[@]}" \
         -C -c --clear -o "$BACKUP_DIR")"
   mydumper \
     --defaults-file="$mydumper_cnf" \
@@ -1434,6 +1580,7 @@ EOF
     --port "$MYSQL_PORT" \
     --database "$MYSQL_DATABASE" \
     --source-data \
+    "${sv_args[@]}" \
     -C -c --clear -o "$BACKUP_DIR" || mydumper_rc=$?
   rm -f "$mydumper_cnf"
   if [[ "$mydumper_rc" -ne 0 ]]; then
@@ -1493,6 +1640,15 @@ EOF
       BINLOG_POSITION_END=""
       BINLOG_ANCHOR_OK="no"
       log_binlog_anchor_diagnostics "$BACKUP_DIR"
+      # Also record the server-side preconditions and the product/version the
+      # override was (or was not) derived from, so the exact reason the anchor is
+      # missing is visible without reproducing the run.
+      log_mysql_binlog_diagnostics
+      if [[ -n "$mydumper_sv" ]]; then
+        warn "Anchor missing DESPITE --server-version='${mydumper_sv}'; the metadata has no usable [source] section."
+      else
+        warn "Anchor missing AND no --server-version override could be derived; mydumper was left to auto-detect (this fails on MySQL 8.4+ when @@version_comment hides the MySQL identity)."
+      fi
       warn "mydumper metadata did not contain a usable binlog anchor (anchor_rc=${anchor_rc}); this FULL is a valid logical baseline but CANNOT serve as a base for TRUE_INCREMENTAL until a FULL with an anchor is taken."
     fi
   else
@@ -1778,7 +1934,7 @@ fetch_binlog_file_via_copy() {
 }
 
 # Fetch one binlog file with `mysqlbinlog --read-from-remote-server --raw`.
-# Writes the raw bytes into a temp --result-dir, then moves them to <dest>.
+# Writes the raw bytes into a temp directory, then moves them to <dest>.
 fetch_binlog_file_via_mysqlbinlog() {
   local file="$1"
   local dest="$2"
@@ -1796,14 +1952,27 @@ EOF
   local outdir
   outdir="$(mktemp -d)"
   local rc=0
-  # --raw + -R writes the raw binlog file(s) into --result-dir. --server-id is
-  # required by --raw and comes from MYSQLBINLOG_SERVER_ID (never hard-coded).
-  "$MYSQLBINLOG_BIN" --defaults-extra-file="$cnf" \
-    --read-from-remote-server \
-    --server-id="${MYSQLBINLOG_SERVER_ID}" \
-    --raw \
-    --result-dir "$outdir" \
-    "$file" || rc=$?
+  # CAPTURE FORM — this must work on the MySQL *client* (the Dockerfile installs
+  # the MySQL 8.4 client, NOT MariaDB's).
+  #
+  # `--raw` (requires -R/--read-from-remote-server) writes the raw binlog bytes.
+  # It does NOT support `--result-dir`: that option exists only in MariaDB's
+  # mysqlbinlog, and the MySQL client rejects it outright with
+  #     mysqlbinlog: [ERROR] unknown option '--result-dir'.
+  # so every `raw` capture would fail. Instead we run with the TEMP DIRECTORY AS
+  # THE CWD, where mysqlbinlog's default behaviour is to create a file named
+  # after the binlog (`binlog.000001`) -- the portable, version-independent form.
+  #
+  # --server-id is required by --raw and comes from MYSQLBINLOG_SERVER_ID
+  # (never hard-coded).
+  (
+    cd "$outdir" || exit 1
+    "$MYSQLBINLOG_BIN" --defaults-extra-file="$cnf" \
+      --read-from-remote-server \
+      --server-id="${MYSQLBINLOG_SERVER_ID}" \
+      --raw \
+      "$file"
+  ) || rc=$?
   rm -f "$cnf"
 
   if [[ "$rc" -ne 0 ]]; then
@@ -1811,11 +1980,16 @@ EOF
     return 1
   fi
 
-  # mysqlbinlog writes the file using the binlog base name. Find it.
+  # Prefer the file named after the source binlog; otherwise take the first
+  # regular file produced (some clients append a suffix to the name).
   local produced="" candidate
-  while IFS= read -r candidate; do
-    [[ -n "$candidate" ]] && { produced="$candidate"; break; }
-  done < <(find "$outdir" -type f 2>/dev/null)
+  if [[ -s "$outdir/$file" ]]; then
+    produced="$outdir/$file"
+  else
+    while IFS= read -r candidate; do
+      [[ -n "$candidate" ]] && { produced="$candidate"; break; }
+    done < <(find "$outdir" -type f 2>/dev/null)
+  fi
 
   if [[ -z "$produced" || ! -s "$produced" ]]; then
     rm -rf "$outdir"

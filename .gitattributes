@@ -1,2 +1,19 @@
-﻿*.sh text eol=lf
-Dockerfile text eol=lf
+# Normalize every tracked text file to LF.
+#
+# This repository is edited on Windows. With core.autocrlf=false a CRLF working
+# tree is compared byte-for-byte against an LF index, so every file that a
+# Windows editor touched showed up as a large false "modification". Declaring
+# `text eol=lf` makes git apply the CRLF->LF clean filter on comparison, which
+# keeps Windows checkouts noise-free while never committing CRLF into the repo.
+#
+# Only text formats are listed. A `text` attribute on a binary file would corrupt
+# it, so binaries keep the default (auto-detected) behaviour.
+
+*.sh            text eol=lf
+Dockerfile      text eol=lf
+*.md            text eol=lf
+*.sql           text eol=lf
+*.php           text eol=lf
+*.json          text eol=lf
+.gitignore      text eol=lf
+.gitattributes  text eol=lf

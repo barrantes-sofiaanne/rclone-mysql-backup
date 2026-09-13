@@ -393,8 +393,12 @@ chmod +x "$FLOW_DIR/mysql"
 
 cat > "$FLOW_DIR/mysqlbinlog" <<'STUB'
 #!/usr/bin/env bash
-# Minimal mysqlbinlog double: --raw writes raw bytes into --result-dir; a plain
-# read emits a SQL stream. Any other usage exits 0 so unrelated paths still work.
+# Minimal mysqlbinlog double, faithful to the REAL MySQL 8.x client:
+#   - `--result-dir` is REJECTED (MariaDB-only). The MySQL client errors with
+#     "unknown option '--result-dir'", so a double that accepted it would hide
+#     a capture that can never work in production.
+#   - `--raw` writes the binlog into the CWD named after the binlog basename.
+#   - a plain read emits a SQL stream. Other usage exits 0.
 result_dir=""; raw=0; files=()
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -402,15 +406,14 @@ while [[ $# -gt 0 ]]; do
     --read-from-remote-server) shift;;
     --server-id) shift 2;;
     --raw) raw=1; shift;;
-    --result-dir) result_dir="$2"; shift 2;;
+    --result-dir|--result-dir=*) echo "mysqlbinlog: [ERROR] unknown option '--result-dir'." >&2; exit 2;;
     --start-position|--stop-position) shift 2;;
     -*) shift;;
     *) files+=("$1"); shift;;
   esac
 done
 if [[ "$raw" -eq 1 ]]; then
-  mkdir -p "$result_dir"
-  for f in "${files[@]}"; do printf 'RAW:%s' "$f" > "$result_dir/$f"; done
+  for f in "${files[@]}"; do printf 'RAW:%s' "$f" > "$(basename "$f")"; done
   exit 0
 fi
 for f in "${files[@]}"; do printf -- '-- %s\nSQL;\n' "$f"; done
@@ -948,6 +951,171 @@ rm -rf "$STATE_DIR"
 unset STATE_DIR
 
 # ---------------------------------------------------------------------------
+# State / lock remote paths MUST be bucket-qualified
+# ---------------------------------------------------------------------------
+# Regression for a real state-path bug: BACKUP_STATE_REMOTE and
+# BACKUP_LOCK_REMOTE were built from R2_PATH ALONE, without R2_BUCKET. An rclone
+# remote path is `remote:<bucket>/<key>`, so the state and the lock were written
+# to a DIFFERENT bucket than the backups they describe — the FULL uploaded to
+# `<bucket>/<path>/full/...` while the state went to `<path>/state/...`.
+#
+# Consequence: `load_state` never found the state (so every run looked like a
+# first run and re-decided FULL), and the distributed lock protected nothing.
+# This is invisible to any test that only checks the PARSE logic, so it is pinned
+# here against the real variable values.
+echo "== state/lock remote paths include the bucket =="
+
+# Use a DISTINCT bucket/path so the assertion cannot pass by coincidence with
+# values used elsewhere in the suite.
+R2_BUCKET="rmb-test"
+R2_PATH="integration-test/mysql-backup-v2"
+BACKUP_STATE_REMOTE="${R2_BUCKET}/${R2_PATH%/}/state/backup_state.json"
+BACKUP_LOCK_REMOTE="${R2_BUCKET}/${R2_PATH%/}/state/backup.lock"
+
+assert_eq "BACKUP_STATE_REMOTE includes R2_BUCKET" "rmb-test" "${BACKUP_STATE_REMOTE%%/*}"
+assert_eq "BACKUP_LOCK_REMOTE includes R2_BUCKET" "rmb-test" "${BACKUP_LOCK_REMOTE%%/*}"
+assert_contains "BACKUP_STATE_REMOTE starts with <bucket>/<path>" \
+  "$BACKUP_STATE_REMOTE" "rmb-test/integration-test/mysql-backup-v2/"
+assert_contains "BACKUP_LOCK_REMOTE starts with <bucket>/<path>" \
+  "$BACKUP_LOCK_REMOTE" "rmb-test/integration-test/mysql-backup-v2/"
+assert_contains "BACKUP_STATE_REMOTE ends with the state key" \
+  "$BACKUP_STATE_REMOTE" "/state/backup_state.json"
+assert_contains "BACKUP_LOCK_REMOTE ends with the lock key" \
+  "$BACKUP_LOCK_REMOTE" "/state/backup.lock"
+
+# The state/lock bucket must be IDENTICAL to the bucket the FULL uploads to.
+FULL_UPLOAD_REMOTE="${R2_BUCKET}/${R2_PATH%/}/full/2026/09/12/full_X"
+assert_eq "FULL upload, state and lock share one bucket" "one_bucket" \
+  "$(b="${FULL_UPLOAD_REMOTE%%/*}"; s="${BACKUP_STATE_REMOTE%%/*}"; l="${BACKUP_LOCK_REMOTE%%/*}"
+     if [[ "$b" == "$s" && "$s" == "$l" ]]; then echo one_bucket; else echo "b=$b s=$s l=$l"; fi)"
+# ...and they share the same base path prefix, so they live beside each other.
+assert_eq "state and lock share the FULL's path prefix" "same_prefix" \
+  "$(p="${R2_BUCKET}/${R2_PATH%/}"
+     if [[ "$BACKUP_STATE_REMOTE" == "$p/"* && "$BACKUP_LOCK_REMOTE" == "$p/"* && "$FULL_UPLOAD_REMOTE" == "$p/"* ]]; then
+       echo same_prefix; else echo mismatch; fi)"
+
+# STATIC GUARD: the DEFINITIONS in entrypoint.sh must be bucket-qualified. This
+# is what actually fails if the bug is reintroduced, and it does not depend on
+# the values above.
+assert_eq "entrypoint defines BACKUP_STATE_REMOTE with R2_BUCKET" \
+  "1" "$(grep -c -F 'BACKUP_STATE_REMOTE="${R2_BUCKET}/${R2_PATH%/}/state/backup_state.json"' "$ENTRYPOINT" || true)"
+assert_eq "entrypoint defines BACKUP_LOCK_REMOTE with R2_BUCKET" \
+  "1" "$(grep -c -F 'BACKUP_LOCK_REMOTE="${R2_BUCKET}/${R2_PATH%/}/state/backup.lock"' "$ENTRYPOINT" || true)"
+# Negative control: NO state/lock remote may be built from R2_PATH alone. A bare
+# `${R2_PATH%/}/state/...` (no ${R2_BUCKET} prefix on the same line) is the bug.
+assert_eq "no state/lock path is built without R2_BUCKET" \
+  "0" "$(grep -n -E '^[A-Z_]+="\$\{R2_PATH%/\}/state/' "$ENTRYPOINT" | wc -l)"
+
+# The bucket-qualified paths are only useful if the call sites use these SAME
+# variables (not a re-derived literal).
+assert_contains "load_state reads BACKUP_STATE_REMOTE" \
+  "$(sed -n '/^load_state()/,/^}/p' "$ENTRYPOINT")" 'remote:${BACKUP_STATE_REMOTE}'
+assert_contains "update_state writes BACKUP_STATE_REMOTE" \
+  "$(sed -n '/^update_state()/,/^}/p' "$ENTRYPOINT")" 'remote:${BACKUP_STATE_REMOTE}'
+assert_contains "acquire_lock uses BACKUP_LOCK_REMOTE" \
+  "$(sed -n '/^acquire_lock()/,/^}/p' "$ENTRYPOINT")" 'remote:${BACKUP_LOCK_REMOTE}'
+assert_contains "release_lock uses BACKUP_LOCK_REMOTE" \
+  "$(sed -n '/^release_lock()/,/^}/p' "$ENTRYPOINT")" 'remote:${BACKUP_LOCK_REMOTE}'
+# The lock must be deleted from the SAME object it was created in, otherwise a
+# run could leave a permanent (6h) lock behind in the other bucket.
+assert_contains "the lock's remote path is defined once (no second, unqualified path)" \
+  "1" "$(grep -c -E '^BACKUP_LOCK_REMOTE=' "$ENTRYPOINT" || true)"
+
+# ---------------------------------------------------------------------------
+# Execution order in main(): configure_rclone -> acquire_lock -> load_state ->
+# determine_backup_type
+# ---------------------------------------------------------------------------
+# The lock MUST be taken before the state is read: the state is
+# read-modify-write, so reading it before mutual exclusion is established would
+# let two concurrent runs read the same boundary and both advance it. And the
+# state must be loaded BEFORE the type decision, because the decision is derived
+# from it. This asserts the source order directly so a refactor cannot quietly
+# reorder the sequence.
+echo "== main() execution order =="
+# `configure_rclone` is called from more than one function, so take main()'s
+# occurrence (the LAST one) — the earlier call belongs to a different path.
+ORDER_CR="$(grep -n -E '^  configure_rclone$' "$ENTRYPOINT" | tail -n1 | cut -d: -f1)"
+ORDER_AL="$(grep -n -F 'if ! acquire_lock; then' "$ENTRYPOINT" | head -n1 | cut -d: -f1)"
+ORDER_LS="$(grep -n -F '  load_state' "$ENTRYPOINT" | head -n1 | cut -d: -f1)"
+ORDER_DB="$(grep -n -F '  determine_backup_type' "$ENTRYPOINT" | head -n1 | cut -d: -f1)"
+if [[ -n "$ORDER_CR" && -n "$ORDER_AL" && -n "$ORDER_LS" && -n "$ORDER_DB" ]] \
+   && [[ "$ORDER_CR" -lt "$ORDER_AL" && "$ORDER_AL" -lt "$ORDER_LS" && "$ORDER_LS" -lt "$ORDER_DB" ]]; then
+  pass "main() order is configure_rclone(${ORDER_CR}) -> acquire_lock(${ORDER_AL}) -> load_state(${ORDER_LS}) -> determine_backup_type(${ORDER_DB})"
+else
+  fail "main() order regressed (configure_rclone=${ORDER_CR:-?} acquire_lock=${ORDER_AL:-?} load_state=${ORDER_LS:-?} determine_backup_type=${ORDER_DB:-?})"
+fi
+
+echo "== mysqlbinlog raw capture form (MySQL 8.x client) =="
+
+# The `raw` fetch strategy shells out to mysqlbinlog. The Dockerfile installs the
+# MYSQL client (not MariaDB's), and the two are NOT interchangeable here:
+#
+#   `--result-dir` is a MARIADB-ONLY option. MySQL's mysqlbinlog rejects it with
+#       mysqlbinlog: [ERROR] unknown option '--result-dir'.
+#   so a capture written that way fails at runtime with a non-zero status while
+#   every unit test still passes (the doubles accepted the flag).
+#
+# MySQL's portable form is to run with the destination directory as the CWD and
+# let mysqlbinlog create a file named after the binlog. These assertions pin that
+# form, and the tool double REJECTS --result-dir so a regression fails here.
+CAPPED_FN="$(sed -n '/^fetch_binlog_file_via_mysqlbinlog()/,/^}/p' "$ENTRYPOINT")"
+# Assert against the CODE only: the function's comments deliberately NAME
+# `--result-dir` to explain why it must not be used, so a naive substring check
+# on the raw text would match that explanation instead of a real invocation.
+CAPPED_CODE="$(printf '%s\n' "$CAPPED_FN" | grep -v -E '^[[:space:]]*#')"
+assert_not_contains "raw capture does NOT pass --result-dir (MariaDB-only option)" \
+  "$CAPPED_CODE" "--result-dir"
+assert_contains "raw capture runs mysqlbinlog from the destination directory" \
+  "$CAPPED_CODE" 'cd "$outdir"'
+assert_contains "raw capture still uses --read-from-remote-server" \
+  "$CAPPED_CODE" "--read-from-remote-server"
+assert_contains "raw capture still uses --raw" "$CAPPED_CODE" "--raw"
+assert_contains "raw capture still passes the configured server id" \
+  "$CAPPED_CODE" '--server-id="${MYSQLBINLOG_SERVER_ID}"'
+
+# FUNCTIONAL PROOF through the real function and a Faithful double: a capture
+# must succeed, and the bytes must land at <dest>.
+CAP_DIR="$(mktemp -d)"
+export CAP_DIR
+cat > "$CAP_DIR/mysqlbinlog" <<'STUB'
+#!/usr/bin/env bash
+# Faithful to the MySQL 8.x client: --result-dir is REJECTED.
+raw=0; files=()
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --defaults-extra-file) shift 2;;
+    --read-from-remote-server) shift;;
+    --server-id) shift 2;;
+    --raw) raw=1; shift;;
+    --result-dir|--result-dir=*) echo "mysqlbinlog: [ERROR] unknown option '--result-dir'." >&2; exit 2;;
+    -*) shift;;
+    *) files+=("$1"); shift;;
+  esac
+done
+[[ "$raw" -eq 1 ]] || exit 0
+for f in "${files[@]}"; do printf 'RAWBINLOG:%s' "$f" > "$(basename "$f")"; done
+exit 0
+STUB
+chmod +x "$CAP_DIR/mysqlbinlog"
+CAP_OLD_PATH="$PATH"
+export PATH="$CAP_DIR:$PATH"
+export MYSQLBINLOG_BIN="mysqlbinlog" MYSQLBINLOG_SERVER_ID=424242
+CAP_DEST="$CAP_DIR/captured.bin"
+if fetch_binlog_file_via_mysqlbinlog "binlog.000070" "$CAP_DEST" >"$CAP_DIR/log" 2>&1; then
+  pass "raw capture succeeds with the MySQL 8.x client form"
+else
+  fail "raw capture failed with the MySQL 8.x client form"
+  sed 's/^/       /' "$CAP_DIR/log" 2>/dev/null | head -5
+fi
+assert_eq "raw capture writes the bytes to <dest>" "RAWBINLOG:binlog.000070" \
+  "$(cat "$CAP_DEST" 2>/dev/null)"
+
+export PATH="$CAP_OLD_PATH"
+export MYSQLBINLOG_BIN="mysqlbinlog"
+rm -rf "$CAP_DIR"
+unset CAP_DIR
+
+# ---------------------------------------------------------------------------
 # MySQL binlog prerequisite + boundary + incremental packaging
 # ---------------------------------------------------------------------------
 echo "== mysql binlog prerequisite + incremental =="
@@ -988,8 +1156,10 @@ exit 0
 STUB
 chmod +x "$BIN_DIR/mysql"
 
-# mysqlbinlog stub: writes a minimal SQL stream for local reads, and for --raw
-# (-R) writes a fake raw binlog file into --result-dir.
+# mysqlbinlog stub, faithful to the REAL MySQL 8.x client:
+#   - `--result-dir` is REJECTED (MariaDB-only option).
+#   - a local read emits a minimal SQL stream.
+#   - `--raw` (-R) writes the raw binlog into the CWD named after the basename.
 cat > "$BIN_DIR/mysqlbinlog" <<'STUB'
 #!/usr/bin/env bash
 result_dir=""
@@ -1001,7 +1171,7 @@ while [[ $# -gt 0 ]]; do
     --read-from-remote-server) shift;;
     --server-id) shift 2;;
     --raw) raw=1; shift;;
-    --result-dir) result_dir="$2"; shift 2;;
+    --result-dir|--result-dir=*) echo "mysqlbinlog: [ERROR] unknown option '--result-dir'." >&2; exit 2;;
     --start-position|--stop-position) shift 2;;
     -*) shift;;
     *) files+=("$1"); shift;;
@@ -1009,8 +1179,7 @@ while [[ $# -gt 0 ]]; do
 done
 if [[ "${STUB_MYSQLBINLOG_FAIL:-0}" == "1" ]]; then echo "boom" >&2; exit 1; fi
 if [[ "$raw" -eq 1 ]]; then
-  mkdir -p "$result_dir"
-  for f in "${files[@]}"; do printf 'RAWBINLOG:%s' "$f" > "$result_dir/$f"; done
+  for f in "${files[@]}"; do printf 'RAWBINLOG:%s' "$f" > "$(basename "$f")"; done
   exit 0
 fi
 # Local read: emit SQL for each file (non-empty).
@@ -1140,13 +1309,13 @@ while [[ $# -gt 0 ]]; do
     --read-from-remote-server) shift;;
     --server-id) shift 2;;
     --raw) raw=1; shift;;
-    --result-dir) result_dir="$2"; shift 2;;
+    --result-dir|--result-dir=*) echo "mysqlbinlog: [ERROR] unknown option '--result-dir'." >&2; exit 2;;
     --start-position|--stop-position) shift 2;;
     -*) shift;;
     *) files+=("$1"); shift;;
   esac
 done
-if [[ "$raw" -eq 1 ]]; then mkdir -p "$result_dir"; for f in "${files[@]}"; do printf 'RAW:%s' "$f" > "$result_dir/$f"; done; exit 0; fi
+if [[ "$raw" -eq 1 ]]; then for f in "${files[@]}"; do printf 'RAW:%s' "$f" > "$(basename "$f")"; done; exit 0; fi
 for f in "${files[@]}"; do printf -- '-- %s\nSQL;\n' "$f"; done
 exit 0
 STUB
@@ -1341,11 +1510,11 @@ result_dir=""; raw=0; files=()
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --defaults-extra-file) shift 2;; --read-from-remote-server) shift;;
-    --server-id) shift 2;; --raw) raw=1; shift;; --result-dir) result_dir="$2"; shift 2;;
+    --server-id) shift 2;; --raw) raw=1; shift;; --result-dir|--result-dir=*) echo "mysqlbinlog: [ERROR] unknown option '--result-dir'." >&2; exit 2;;
     --start-position|--stop-position) shift 2;; -*) shift;; *) files+=("$1"); shift;;
   esac
 done
-if [[ "$raw" -eq 1 ]]; then mkdir -p "$result_dir"; for f in "${files[@]}"; do printf 'RAW:%s' "$f" > "$result_dir/$f"; done; exit 0; fi
+if [[ "$raw" -eq 1 ]]; then for f in "${files[@]}"; do printf 'RAW:%s' "$f" > "$(basename "$f")"; done; exit 0; fi
 for f in "${files[@]}"; do printf -- '-- %s\nSQL;\n' "$f"; done
 exit 0
 STUB
@@ -1557,6 +1726,159 @@ if [[ "$A_PATH" != "$B_PATH" ]]; then pass "full and incremental paths differ"; 
 # Two runs in different seconds produce different names.
 N1="full_2026-09-11_020000"; N2="full_2026-09-11_020001"
 if [[ "$N1" != "$N2" ]]; then pass "backup names are unique per second"; else fail "backup names must be unique"; fi
+
+# ---------------------------------------------------------------------------
+# MyDumper MySQL 8.4 server-version override (binlog anchor on 8.4+)
+# ---------------------------------------------------------------------------
+# ROOT CAUSE this guards: mydumper picks the snapshot-coordinate statement in
+# server_detect.c:detect_replica(). It starts from the PRE-8.4 default
+# `SHOW MASTER STATUS` and upgrades to `SHOW BINARY LOG STATUS` only when its
+# product detection classifies the server as MySQL >= 8.<n>. Detection reads
+# `@@version_comment, @@version`; if neither contains a known product token the
+# server is UNKNOWN with version 0.0.0, the upgrade is skipped, MySQL 8.4
+# rejects `SHOW MASTER STATUS` (ERROR 1064), and the metadata is written with NO
+# `[source]` section -> the FULL records no anchor.
+#
+# The fix derives mydumper's own `--server-version <product>-<x.y.z>` from the
+# LIVE server (never hard-coded) so the 8.4 statement is selected.
+#
+# The double below reproduces that behaviour exactly: it emits a real `[source]`
+# section ONLY when --server-version is present, and otherwise writes the keys
+# commented-out with no section (which is what the broken path produces).
+echo "== mydumper MySQL 8.4 server-version override =="
+
+# --- pure helper: the derived override -------------------------------------
+# A `mysql` double that answers `SELECT @@version, @@version_comment` from env,
+# exactly as mysql_query drives it (-N -B => tab-separated, no headers).
+SV_DIR="$(mktemp -d)"
+export SV_DIR
+cat > "$SV_DIR/mysql" <<'STUB'
+#!/usr/bin/env bash
+# Only the version probe and the 8.4 statement probe are needed here; mysql_query
+# drives the client with `-N -B` (tab-separated, no headers).
+case "$*" in
+  *"@@version"*)       printf '%s\t%s' "${SV_VERSION:-}" "${SV_COMMENT:-}"; exit 0;;
+  *"BINARY LOG STATUS"*)
+    # Behavioural probe: only a MySQL 8.4+ server answers this. SV_BLS=1 models
+    # one; anything else fails the probe exactly as a pre-8.4 server would.
+    [[ "${SV_BLS:-0}" == "1" ]] && { printf 'binlog.000001\t4'; exit 0; }
+    exit 1;;
+esac
+exit 0
+STUB
+chmod +x "$SV_DIR/mysql"
+SV_OLD_PATH="$PATH"
+export PATH="$SV_DIR:$PATH"
+export MYSQL_CLIENT_BIN="mysql"
+
+detect_case() { # <desc> <version> <comment> <expected>
+  local desc="$1" want="$4" got
+  export SV_VERSION="$2" SV_COMMENT="$3" SV_BLS=0
+  got="$(detect_mydumper_server_version 2>/dev/null || true)"
+  assert_eq "$desc" "$want" "$got"
+}
+
+detect_case "MySQL Community Server -> mysql-<x.y.z>" \
+  "8.4.11" "MySQL Community Server - GPL" "mysql-8.4.11"
+# The production failure case: neither the comment NOR the version contains a
+# product token, so the override must be derived from BEHAVIOUR instead.
+export SV_VERSION="8.4.10-0ubuntu0.26.04.1" SV_COMMENT="(Ubuntu)" SV_BLS=1
+SV_GOT="$(detect_mydumper_server_version 2>/dev/null || true)"
+assert_eq "distro comment with no token is confirmed behaviourally" \
+  "mysql-8.4.10" "$SV_GOT"
+# Same strings, but a server that does NOT answer the 8.4 statement -> no
+# override (we must not claim MySQL 8.4 for a server that is not one).
+export SV_BLS=0
+SV_GOT="$(detect_mydumper_server_version 2>/dev/null || true)"
+assert_eq "no product token and no 8.4 behaviour yields no override" "" "$SV_GOT"
+export SV_BLS=0
+
+detect_case "RHEL-suffixed version reduces to x.y.z" \
+  "8.4.11-1.el9" "MySQL Community Server - GPL" "mysql-8.4.11"
+detect_case "MariaDB is classified as mariadb" \
+  "10.11.6-MariaDB" "mariadb.org binary distribution" "mariadb-10.11.6"
+detect_case "Percona is classified as percona" \
+  "8.0.36-28" "Percona Server" "percona-8.0.36"
+# An explicit token always wins over the behavioural probe.
+detect_case "an unclassifiable server yields no override" \
+  "9.9.9" "Totally Unknown Build" ""
+detect_case "empty version yields no override" "" "" ""
+
+# --- the override reaches the mydumper invocation --------------------------
+FULL_SRC="$(sed -n '/^run_full_backup()/,/^}/p' "$ENTRYPOINT")"
+assert_contains "run_full_backup derives the override from the live server" \
+  "$FULL_SRC" 'detect_mydumper_server_version'
+assert_contains "run_full_backup passes --server-version to mydumper" \
+  "$FULL_SRC" '"${sv_args[@]}"'
+assert_contains "run_full_backup still passes --source-data" \
+  "$FULL_SRC" '--source-data'
+# The override must be conditional: when the server is unclassifiable the option
+# is omitted entirely, so behaviour is unchanged for servers we cannot identify.
+assert_contains "the override is only added when it could be derived" \
+  "$FULL_SRC" 'sv_args=(--server-version "$mydumper_sv")'
+# The value must never be hard-coded to a specific vendor version.
+assert_contains "the override value comes from a variable, not a literal" \
+  "$FULL_SRC" 'sv_args=(--server-version "$mydumper_sv")'
+assert_not_contains "no vendor version literal in the override assignment" \
+  "$FULL_SRC" 'sv_args=(--server-version mysql-'
+
+# The behavioural probe must exist and be used when no product token matches: a
+# distro `@@version_comment` (e.g. `(Ubuntu)`) hides the MySQL identity from
+# mydumper's own detector, which is the production failure mode.
+DETECT_SRC="$(sed -n '/^detect_mydumper_server_version()/,/^}/p' "$ENTRYPOINT")"
+assert_contains "an unknown identity is confirmed behaviourally" \
+  "$DETECT_SRC" 'mysql_supports_binary_log_status'
+assert_contains "the behavioural probe issues the MySQL 8.4 statement" \
+  "$(sed -n '/^mysql_supports_binary_log_status()/,/^}/p' "$ENTRYPOINT")" \
+  'SHOW BINARY LOG STATUS'
+
+# --- functional proof through the entrypoint parser + a faithful double -----
+cat > "$SV_DIR/mydumper" <<'STUB'
+#!/usr/bin/env bash
+# Faithful mydumper double: the snapshot [source] section appears ONLY when
+# --server-version is supplied (mirroring the real MySQL 8.4 behaviour).
+out=""; args="$*"; saw_sv=0
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --server-version) saw_sv=1; shift 2;;
+    --server-version=*) saw_sv=1; shift;;
+    -o) out="$2"; shift 2;;
+    *) shift;;
+  esac
+done
+printf '%s\n' "$args" > "$SV_DIR/cmdline"
+mkdir -p "$out"; printf 'schema' > "$out/db.schema.sql"
+if [[ "$saw_sv" -eq 1 ]]; then
+  printf '[source]\nSOURCE_LOG_FILE = "binlog.000042"\nSOURCE_LOG_POS = 777\n' > "$out/metadata"
+else
+  # The broken path: no [source] section at all (keys absent/commented).
+  printf '[config]\nquote-character = BACKTICK\n# SOURCE_LOG_FILE = "binlog.000042"\n' > "$out/metadata"
+fi
+exit 0
+STUB
+chmod +x "$SV_DIR/mydumper"
+
+SV_OUT="$SV_DIR/with"
+"$SV_DIR/mydumper" --source-data --server-version mysql-8.4.10 -C -c -o "$SV_OUT" >/dev/null 2>&1
+SV_ANCHOR="$(read_mydumper_binlog_anchor "$SV_OUT" || true)"
+assert_eq "with --server-version the parser yields the anchor" \
+  "$(printf 'binlog.000042\t777')" "$SV_ANCHOR"
+
+SV_OUT2="$SV_DIR/without"
+"$SV_DIR/mydumper" --source-data -C -c -o "$SV_OUT2" >/dev/null 2>&1
+SV_ANCHOR2="$(read_mydumper_binlog_anchor "$SV_OUT2" || true)"
+assert_eq "without --server-version there is no anchor (the failure mode)" "" "$SV_ANCHOR2"
+# The commented key must never be mistaken for an anchor.
+assert_not_contains "the commented SOURCE_LOG_FILE is not the anchor" "$SV_ANCHOR2" "binlog.000042"
+# Negative control: the double really does differ between the two modes, so the
+# assertion above tests the flag and not a constant.
+assert_not_contains "the WITH-mode metadata is genuinely different" \
+  "$(cat "$SV_OUT/metadata")" "[config]"
+
+export PATH="$SV_OLD_PATH"
+export MYSQL_CLIENT_BIN="mysql"
+rm -rf "$SV_DIR"
+unset SV_DIR SV_VERSION SV_COMMENT
 
 # ---------------------------------------------------------------------------
 # 18. Existing daily_snapshot compatibility is preserved.
@@ -1907,7 +2229,7 @@ while [[ $# -gt 0 ]]; do
     --read-from-remote-server) shift;;
     --server-id) shift 2;;
     --raw) raw=1; shift;;
-    --result-dir) result_dir="$2"; shift 2;;
+    --result-dir|--result-dir=*) echo "mysqlbinlog: [ERROR] unknown option '--result-dir'." >&2; exit 2;;
     --start-position|--stop-position) shift 2;;
     -*) shift;;
     *) files+=("$1"); shift;;
@@ -1937,8 +2259,7 @@ if [[ "$raw" -eq 0 && "${#files[@]}" -gt 0 ]]; then
 fi
 if [[ "${RANGE_BINLOG_FAIL:-0}" == "1" ]]; then echo "mysqlbinlog: failed" >&2; exit 1; fi
 if [[ "$raw" -eq 1 ]]; then
-  mkdir -p "$result_dir"
-  for f in "${files[@]}"; do printf 'RAWBINLOG:%s' "$f" > "$result_dir/$f"; done
+  for f in "${files[@]}"; do printf 'RAWBINLOG:%s' "$f" > "$(basename "$f")"; done
   exit 0
 fi
 for f in "${files[@]}"; do printf -- '-- %s\nSQL;\n' "$f"; done
@@ -2215,15 +2536,14 @@ while [[ $# -gt 0 ]]; do
     --server-id) sid="$2"; shift 2;;
     --server-id=*) sid="${1#--server-id=}"; shift;;
     --raw) shift;;
-    --result-dir) result_dir="$2"; shift 2;;
+    --result-dir|--result-dir=*) echo "mysqlbinlog: [ERROR] unknown option '--result-dir'." >&2; exit 2;;
     --start-position|--stop-position) shift 2;;
     -*) shift;;
     *) files+=("$1"); shift;;
   esac
 done
 printf '%s' "$sid" > "$SID_DIR/server_id_seen"
-mkdir -p "$result_dir"
-for f in "${files[@]}"; do printf 'RAW:%s' "$f" > "$result_dir/$f"; done
+for f in "${files[@]}"; do printf 'RAW:%s' "$f" > "$(basename "$f")"; done
 exit 0
 STUB
 chmod +x "$SID_DIR/mysqlbinlog"
@@ -2488,11 +2808,11 @@ while [[ $# -gt 0 ]]; do
   case "$1" in
     --defaults-extra-file) shift 2;; --read-from-remote-server) shift;;
     --server-id) shift 2;; --server-id=*) shift;;
-    --raw) raw=1; shift;; --result-dir) result_dir="$2"; shift 2;;
+    --raw) raw=1; shift;; --result-dir|--result-dir=*) echo "mysqlbinlog: [ERROR] unknown option '--result-dir'." >&2; exit 2;;
     --start-position|--stop-position) shift 2;; -*) shift;; *) files+=("$1"); shift;;
   esac
 done
-if [[ "$raw" -eq 1 ]]; then mkdir -p "$result_dir"; for f in "${files[@]}"; do printf 'RAW:%s' "$f" > "$result_dir/$f"; done; exit 0; fi
+if [[ "$raw" -eq 1 ]]; then for f in "${files[@]}"; do printf 'RAW:%s' "$f" > "$(basename "$f")"; done; exit 0; fi
 for f in "${files[@]}"; do printf -- '-- %s\nSQL;\n' "$f"; done
 exit 0
 STUB
@@ -2645,13 +2965,12 @@ while [[ $# -gt 0 ]]; do
     --server-id) shift 2;;
     --server-id=*) shift;;
     --raw) shift;;
-    --result-dir) result_dir="$2"; shift 2;;
+    --result-dir|--result-dir=*) echo "mysqlbinlog: [ERROR] unknown option '--result-dir'." >&2; exit 2;;
     -*) shift;;
     *) files+=("$1"); shift;;
   esac
 done
-mkdir -p "$result_dir"
-for f in "${files[@]}"; do printf 'RAW:%s' "$f" > "$result_dir/$f"; done
+for f in "${files[@]}"; do printf 'RAW:%s' "$f" > "$(basename "$f")"; done
 exit 0
 STUB
 chmod +x "$CRED_DIR/mysqlbinlog"
@@ -3116,6 +3435,64 @@ assert_contains "the failure is reported to PUPTracker as failed" \
 # State must be byte-identical: a refused incremental must not advance the chain.
 assert_eq "anchor-less FULL cannot advance incremental state" \
   "$DIAG_NOANCHOR_STATE_BEFORE" "$(cat "$DIAG_BUCKET/backup_state.json" 2>/dev/null)"
+
+# --- (f3) THE REPORTED PRODUCTION STATE must not become an incremental base.
+# This is the EXACT state object observed on the disposable service:
+#     last_successful_full_backup_name = full_2026-09-12_164735
+#     last_binlog_file = ""
+#     last_binlog_position = 0
+# A FULL that recorded no anchor must be refused as an incremental parent even
+# though it IS a valid successful FULL base. "Do not fabricate an anchor" means
+# this stays a hard refusal — the state is NOT migrated, patched or inferred.
+#
+# NOTE: this deliberately OVERWRITES $DIAG_BUCKET/backup_state.json, so it runs
+# AFTER (f2), which needs the state the earlier runs produced.
+CATHY_STATE="$DIAG_BUCKET/backup_state.json"
+rm -f "$CATHY_STATE" "$DIAG_BUCKET/reports.log"
+cat > "$CATHY_STATE" <<'JSON'
+{
+  "state_version": 1,
+  "updated_at": "2026-09-12T16:47:40Z",
+  "last_successful_full_backup_name": "full_2026-09-12_164735",
+  "last_successful_full_completed_at": "2026-09-12T16:47:35Z",
+  "last_successful_full_storage_path": "integration-test/mysql-backup-v2/full/2026/09/12/full_2026-09-12_164735",
+  "last_binlog_file": "",
+  "last_binlog_position": 0,
+  "last_binlog_end_file": "",
+  "last_binlog_end_position": 0
+}
+JSON
+CATHY_STATE_BEFORE="$(cat "$CATHY_STATE")"
+DIAG_LEGACY_RC=0
+(
+  cd "$DIAG_DIR" || exit 1
+  MYSQL_HOST=h MYSQL_USER=u MYSQL_PASSWORD=p MYSQL_DATABASE=d MYSQL_PORT=3306 \
+  MYSQL_CLIENT_BIN=mysql MYSQLBINLOG_BIN=mysqlbinlog MYSQLBINLOG_SERVER_ID=424242 \
+  R2_ACCESS_KEY_ID=a R2_SECRET_ACCESS_KEY=s R2_ENDPOINT=e R2_BUCKET=b \
+  R2_PATH=mysql-backup R2_PROVIDER=Other R2_ACL= \
+  BACKUP_REPORT_URL="https://puptvs.com/x" BACKUP_REPORT_TOKEN=tok REPORT_TIMEOUT=5 \
+  BACKUP_BINLOG_ENABLED=true BACKUP_BINLOG_VERIFY=true BACKUP_FULL_INTERVAL_DAYS=14 \
+  BACKUP_LOCK_ENABLED=false \
+  RCLONE_CONFIG="$RCLONE_CONFIG" \
+  bash "$ENTRYPOINT" >"$DIAG_DIR/legacy.log" 2>&1
+) || DIAG_LEGACY_RC=$?
+
+assert_rc_nonzero "the reported anchorless FULL cannot start an incremental" "$DIAG_LEGACY_RC"
+assert_contains "it fails for the missing binlog position" \
+  "$(cat "$DIAG_DIR/legacy.log")" "no recorded binlog position"
+assert_contains "it asks for a new FULL" \
+  "$(cat "$DIAG_DIR/legacy.log")" "A new full backup is required"
+assert_contains "the refusal is reported as failed" \
+  "$(cat "$DIAG_BUCKET/reports.log" 2>/dev/null)" '"status":"failed"'
+# CRITICAL: the refusal must not MUTATE the state (no fabricated anchor, no
+# migration). The state object must be byte-identical afterwards.
+assert_eq "the reported state is left byte-identical (not migrated)" \
+  "$CATHY_STATE_BEFORE" "$(cat "$CATHY_STATE")"
+assert_contains "the reported state still records an empty anchor" "$(cat "$CATHY_STATE")" '"last_binlog_file": ""'
+assert_contains "the reported state still records position 0" "$(cat "$CATHY_STATE")" '"last_binlog_position": 0'
+# ...and no incremental was ever uploaded for it.
+assert_eq "no incremental archive is uploaded for the anchorless base" "0" \
+  "$(find "$DIAG_BUCKET" -name 'incremental*' 2>/dev/null | wc -l)"
 
 # --- (g) static guards: the status-bearing stages never lose their own rc to a
 #         later command, and cleanup cannot override the exit status. ---------

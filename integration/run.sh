@@ -585,10 +585,17 @@ backup_run() { # desc -> sets RUN_RC, RUN_LOG
 }
 
 # Parse a field from the container's JSON log line for the last run.
+#
+# The object path MUST include the bucket: an rclone remote path is
+# `remote:<bucket>/<key>`, and the entrypoint writes its state to
+# `<R2_BUCKET>/<R2_PATH>/state/backup_state.json`. Omitting the bucket here makes
+# this helper read a DIFFERENT bucket than the one the backups are written to
+# (and than s3_list_run_objects below), so it would silently report "no state"
+# even after a successful run.
 last_state_json() {
   "$DOCKER" run --rm --network "$NETWORK" "${DOCKER_RUN_HOST_FLAGS[@]}" \
     --env-file "$BACKUP_ENV_FILE" --entrypoint bash "$IMAGE_TAG" -c \
-    "rclone --config \"\$RCLONE_CONFIG\" cat \"remote:${R2_PATH%/}/state/backup_state.json\" 2>/dev/null || true" 2>/dev/null
+    "rclone --config \"\$RCLONE_CONFIG\" cat \"remote:${R2_BUCKET}/${R2_PATH%/}/state/backup_state.json\" 2>/dev/null || true" 2>/dev/null
 }
 
 s3_list_run_objects() {
