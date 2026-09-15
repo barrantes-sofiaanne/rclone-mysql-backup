@@ -887,6 +887,125 @@ acquire_lock() {
     return 0
   fi
 
+  local token="${BACKUP_LOCK_TOKEN_PREFIX:-}${RANDOM}${RANDOM}-$(now_epoch)-$$"
+  local ttl="${BACKUP_LOCK_TTL_SECONDS:-21600}"
+  [[ "$ttl" =~ ^[0-9]+$ ]] || ttl=21600
+  local now expires payload attempts=0
+  local held_expiry held_token lock_age
+
+  log "LOCK-DIAGNOSTIC: enabled=true"
+  log "LOCK-DIAGNOSTIC: ttl_seconds=${ttl}"
+  log "LOCK-DIAGNOSTIC: lock_remote=remote:${BACKUP_LOCK_REMOTE}"
+
+  while :; do
+    attempts=$((attempts + 1))
+    now="$(now_epoch)"
+    expires=$((now + ttl))
+
+    # ------------------------------------------------------------
+    # Diagnostic: inspect an existing lock BEFORE trying to acquire.
+    # This prints only timestamps/status, never the lock token.
+    # ------------------------------------------------------------
+    held_expiry="$(lock_expiry_epoch)"
+
+    if [[ "${held_expiry:-0}" =~ ^[0-9]+$ ]] && [[ "$held_expiry" -gt 0 ]]; then
+      lock_age=$((now - held_expiry))
+
+      if [[ "$held_expiry" -le "$now" ]]; then
+        log "LOCK-DIAGNOSTIC: existing lock=STALE"
+        log "LOCK-DIAGNOSTIC: current_epoch=${now}"
+        log "LOCK-DIAGNOSTIC: expires_epoch=${held_expiry}"
+        log "LOCK-DIAGNOSTIC: expired_seconds_ago=${lock_age#-}"
+      else
+        log "LOCK-DIAGNOSTIC: existing lock=ACTIVE"
+        log "LOCK-DIAGNOSTIC: current_epoch=${now}"
+        log "LOCK-DIAGNOSTIC: expires_epoch=${held_expiry}"
+        log "LOCK-DIAGNOSTIC: seconds_until_expiry=$((held_expiry - now))"
+      fi
+    else
+      log "LOCK-DIAGNOSTIC: existing lock=NOT_READABLE_OR_MISSING"
+      log "LOCK-DIAGNOSTIC: current_epoch=${now}"
+    fi
+
+    tmp="$(mktemp)"
+
+    printf '{\n  "holder": "%s",\n  "token": "%s",\n  "acquired_at_epoch": %s,\n  "expires_at_epoch": %s\n}\n' \
+      "$(json_escape "${HOSTNAME:-unknown}")" \
+      "$(json_escape "$token")" \
+      "$now" \
+      "$expires" > "$tmp"
+
+    payload="$tmp"
+
+    # Atomic create-if-absent.
+    if rclone --config "${RCLONE_CONFIG:-}" copyto \
+        "$payload" \
+        "remote:${BACKUP_LOCK_REMOTE}" >/dev/null 2>&1; then
+
+      rm -f "$payload"
+
+      # Confirm that the lock contains OUR token.
+      if [[ "$(lock_token)" == "$token" ]]; then
+        BACKUP_LOCK_HELD=1
+        BACKUP_LOCK_TOKEN="$token"
+
+        log "LOCK-DIAGNOSTIC: acquisition=SUCCESS"
+        log "LOCK-DIAGNOSTIC: acquired_epoch=${now}"
+        log "LOCK-DIAGNOSTIC: expires_epoch=${expires}"
+        log "Acquired distributed backup lock (expires in ${ttl}s)."
+
+        return 0
+      fi
+
+      warn "LOCK-DIAGNOSTIC: write succeeded but ownership verification failed."
+      warn "Lock write was not acknowledged as ours; retrying lock acquisition."
+
+    else
+      rm -f "$payload"
+
+      held_expiry="$(lock_expiry_epoch)"
+
+      if [[ "${held_expiry:-0}" =~ ^[0-9]+$ ]] \
+          && [[ "${held_expiry:-0}" -gt 0 ]] \
+          && [[ "$held_expiry" -le "$now" ]]; then
+
+        warn "LOCK-DIAGNOSTIC: stale lock detected."
+        warn "LOCK-DIAGNOSTIC: current_epoch=${now}"
+        warn "LOCK-DIAGNOSTIC: expires_epoch=${held_expiry}"
+        warn "LOCK-DIAGNOSTIC: deleting stale lock and retrying."
+
+        rclone --config "${RCLONE_CONFIG:-}" \
+          deletefile "remote:${BACKUP_LOCK_REMOTE}" >/dev/null 2>&1 || true
+
+      else
+
+        warn "LOCK-DIAGNOSTIC: lock acquisition failed and lock is still ACTIVE or unreadable."
+
+        if [[ "${held_expiry:-0}" =~ ^[0-9]+$ ]] && [[ "${held_expiry:-0}" -gt 0 ]]; then
+          warn "LOCK-DIAGNOSTIC: current_epoch=${now}"
+          warn "LOCK-DIAGNOSTIC: expires_epoch=${held_expiry}"
+          warn "LOCK-DIAGNOSTIC: seconds_until_expiry=$((held_expiry - now))"
+        else
+          warn "LOCK-DIAGNOSTIC: expires_epoch=unavailable"
+          warn "LOCK-DIAGNOSTIC: possible causes include unreadable lock object or rclone/R2 error."
+        fi
+      fi
+    fi
+
+    if [[ "$attempts" -ge 2 ]]; then
+      warn "LOCK-DIAGNOSTIC: acquisition attempts exhausted."
+      return 1
+    fi
+  done
+}
+  BACKUP_LOCK_HELD=0
+  BACKUP_LOCK_TOKEN=""
+
+  if [[ "${BACKUP_LOCK_ENABLED:-true}" != "true" ]]; then
+    log "Distributed lock disabled (BACKUP_LOCK_ENABLED=false)."
+    return 0
+  fi
+
   # Each attempt gets a fresh token so a take-over is distinguishable.
   local token="${BACKUP_LOCK_TOKEN_PREFIX:-}${RANDOM}${RANDOM}-$(now_epoch)-$$"
   local ttl="${BACKUP_LOCK_TTL_SECONDS:-21600}"
@@ -903,8 +1022,7 @@ acquire_lock() {
     payload="$tmp"
 
     # Atomic create-if-absent: copyto refuses to overwrite an existing object.
-    if rclone --config "${RCLONE_CONFIG:-}" copyto "$payload" "remote:${BACKUP_LOCK_REMOTE}" >/dev/null 2>&1; then
-      # Confirm WE are the recorded owner (copyto could have succeeded against a
+if rclone --config "${RCLONE_CONFIG:-}" -vv copyto "$payload" "remote:${BACKUP_LOCK_REMOTE}"; then      # Confirm WE are the recorded owner (copyto could have succeeded against a
       # backend that overwrites); discard the lock if not.
       rm -f "$payload"
       if [[ "$(lock_token)" == "$token" ]]; then
@@ -917,7 +1035,21 @@ acquire_lock() {
     else
       rm -f "$payload"
       local held_expiry
-      held_expiry="$(lock_expiry_epoch)"
+      log "[DEBUG] Lock creation failed; checking existing lock at: remote:${BACKUP_LOCK_REMOTE}"
+log "[DEBUG] R2 bucket: ${R2_BUCKET}"
+log "[DEBUG] R2 path: ${R2_PATH}"
+log "[DEBUG] Lock remote: ${BACKUP_LOCK_REMOTE}"
+
+held_expiry="$(lock_expiry_epoch)"
+
+log "[DEBUG] Lock expiry returned: ${held_expiry:-EMPTY}"
+
+existing_token="$(lock_token)"
+if [[ -n "${existing_token:-}" ]]; then
+  log "[DEBUG] Existing lock object is readable and contains a token."
+else
+  log "[DEBUG] Existing lock object is EMPTY or unreadable."
+fi
       if [[ "${held_expiry:-0}" =~ ^[0-9]+$ ]] && [[ "${held_expiry:-0}" -gt 0 ]] && [[ "$held_expiry" -le "$now" ]]; then
         warn "Found a stale backup lock (expired at epoch ${held_expiry}); taking it over."
         rclone --config "${RCLONE_CONFIG:-}" deletefile "remote:${BACKUP_LOCK_REMOTE}" >/dev/null 2>&1 || true
@@ -2064,8 +2196,9 @@ configure_rclone() {
       printf 'type = s3\n'
       printf 'provider = %s\n' "$R2_PROVIDER"
       printf 'access_key_id = %s\n' "$R2_ACCESS_KEY_ID"
-      printf 'secret_access_key = %s\n' "$R2_SECRET_ACCESS_KEY"
-      printf 'endpoint = %s\n' "$R2_ENDPOINT"
+printf 'secret_access_key = %s\n' "$R2_SECRET_ACCESS_KEY"
+printf 'endpoint = %s\n' "$R2_ENDPOINT"
+printf 'no_check_bucket = true\n'
       # Omitted entirely when R2_ACL is empty; some S3-compatible endpoints
       # reject canned ACLs and would otherwise fail every upload.
       if [[ -n "${R2_ACL:-}" ]]; then
@@ -2140,6 +2273,26 @@ main() {
   # --- Acquire the distributed lock BEFORE reading/modifying the chain state. --
   # Two concurrent runs must never read the same state, capture overlapping
   # binlog ranges, and then both advance the state.
+  log "[DEBUG] ===== R2 LOCK DIAGNOSTIC ====="
+log "[DEBUG] R2_BUCKET=${R2_BUCKET}"
+log "[DEBUG] R2_PATH=${R2_PATH}"
+log "[DEBUG] BACKUP_LOCK_REMOTE=${BACKUP_LOCK_REMOTE}"
+log "[DEBUG] BACKUP_STATE_REMOTE=${BACKUP_STATE_REMOTE}"
+
+log "[DEBUG] Listing R2 state directory:"
+rclone --config "${RCLONE_CONFIG:-}" -vv lsf \
+  "remote:${R2_BUCKET}/${R2_PATH%/}/state/" \
+  || warn "[DEBUG] Unable to list R2 state directory"
+
+log "[DEBUG] Checking lock object:"
+rclone --config "${RCLONE_CONFIG:-}" -vv lsjson \
+  "remote:${BACKUP_LOCK_REMOTE}" \
+  || warn "[DEBUG] Lock object does not exist or cannot be read"
+
+log "[DEBUG] ===== END R2 LOCK DIAGNOSTIC ====="
+
+set_stage "lock_acquire"
+  
   set_stage "lock_acquire"
   log "Stage: lock_acquire"
   if ! acquire_lock; then
