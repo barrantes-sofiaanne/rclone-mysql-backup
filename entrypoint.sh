@@ -998,69 +998,6 @@ acquire_lock() {
     fi
   done
 }
-  BACKUP_LOCK_HELD=0
-  BACKUP_LOCK_TOKEN=""
-
-  if [[ "${BACKUP_LOCK_ENABLED:-true}" != "true" ]]; then
-    log "Distributed lock disabled (BACKUP_LOCK_ENABLED=false)."
-    return 0
-  fi
-
-  # Each attempt gets a fresh token so a take-over is distinguishable.
-  local token="${BACKUP_LOCK_TOKEN_PREFIX:-}${RANDOM}${RANDOM}-$(now_epoch)-$$"
-  local ttl="${BACKUP_LOCK_TTL_SECONDS:-21600}"
-  [[ "$ttl" =~ ^[0-9]+$ ]] || ttl=21600
-  local now expires payload tmp attempts=0
-
-  while :; do
-    attempts=$((attempts + 1))
-    now="$(now_epoch)"
-    expires=$((now + ttl))
-    tmp="$(mktemp)"
-    printf '{\n  "holder": "%s",\n  "token": "%s",\n  "acquired_at_epoch": %s,\n  "expires_at_epoch": %s\n}\n' \
-      "$(json_escape "${HOSTNAME:-unknown}")" "$(json_escape "$token")" "$now" "$expires" > "$tmp"
-    payload="$tmp"
-
-    # Atomic create-if-absent: copyto refuses to overwrite an existing object.
-if rclone --config "${RCLONE_CONFIG:-}" -vv copyto "$payload" "remote:${BACKUP_LOCK_REMOTE}"; then      # Confirm WE are the recorded owner (copyto could have succeeded against a
-      # backend that overwrites); discard the lock if not.
-      rm -f "$payload"
-      if [[ "$(lock_token)" == "$token" ]]; then
-        BACKUP_LOCK_HELD=1
-        BACKUP_LOCK_TOKEN="$token"
-        log "Acquired distributed backup lock (expires in ${ttl}s)."
-        return 0
-      fi
-      warn "Lock write was not acknowledged as ours; retrying lock acquisition."
-    else
-      rm -f "$payload"
-      local held_expiry
-      log "[DEBUG] Lock creation failed; checking existing lock at: remote:${BACKUP_LOCK_REMOTE}"
-log "[DEBUG] R2 bucket: ${R2_BUCKET}"
-log "[DEBUG] R2 path: ${R2_PATH}"
-log "[DEBUG] Lock remote: ${BACKUP_LOCK_REMOTE}"
-
-held_expiry="$(lock_expiry_epoch)"
-
-log "[DEBUG] Lock expiry returned: ${held_expiry:-EMPTY}"
-
-existing_token="$(lock_token)"
-if [[ -n "${existing_token:-}" ]]; then
-  log "[DEBUG] Existing lock object is readable and contains a token."
-else
-  log "[DEBUG] Existing lock object is EMPTY or unreadable."
-fi
-      if [[ "${held_expiry:-0}" =~ ^[0-9]+$ ]] && [[ "${held_expiry:-0}" -gt 0 ]] && [[ "$held_expiry" -le "$now" ]]; then
-        warn "Found a stale backup lock (expired at epoch ${held_expiry}); taking it over."
-        rclone --config "${RCLONE_CONFIG:-}" deletefile "remote:${BACKUP_LOCK_REMOTE}" >/dev/null 2>&1 || true
-      fi
-    fi
-
-    if [[ "$attempts" -ge 2 ]]; then
-      return 1
-    fi
-  done
-}
 
 # Release the lock, but ONLY when we are still its owner (a stale take-over by
 # another run must not have its lock deleted by us).
