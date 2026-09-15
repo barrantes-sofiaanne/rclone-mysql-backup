@@ -94,6 +94,7 @@ R2_SECRET_ACCESS_KEY="${R2_SECRET_ACCESS_KEY:-}"
 R2_ENDPOINT="${R2_ENDPOINT:-}"
 R2_BUCKET="${R2_BUCKET:-}"
 R2_PATH="${R2_PATH:-mysql-backup}"
+RCLONE_CONFIG="${RCLONE_CONFIG:-/root/.config/rclone/rclone.conf}"
 # S3 provider/ACL presented to rclone. The defaults target Cloudflare R2. They
 # are overridable so the SAME image can be validated against an S3-compatible
 # endpoint (e.g. MinIO in the integration harness) or pointed at another
