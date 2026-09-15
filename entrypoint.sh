@@ -194,6 +194,7 @@ BACKUP_LOCK_TTL_SECONDS="${BACKUP_LOCK_TTL_SECONDS:-21600}"  # 6h
 # the same `<bucket>/<path>` composition the backup UPLOAD paths use (see
 # upload_and_verify), so state, lock and backups always resolve to one bucket.
 BACKUP_LOCK_REMOTE="${R2_BUCKET}/${R2_PATH%/}/state/backup.lock"
+BACKUP_STATE_REMOTE="${R2_BUCKET}/${R2_PATH%/}/state/backup_state.json"
 
 
 # ---------------------------------------------------------------------------
