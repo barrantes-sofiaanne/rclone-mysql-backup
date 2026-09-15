@@ -149,6 +149,17 @@ BACKUP_TIMEZONE="${BACKUP_TIMEZONE:-UTC}"
 # Override MYSQLBINLOG_SERVER_ID per deployment so every consumer is distinct.
 MYSQLBINLOG_SERVER_ID="${MYSQLBINLOG_SERVER_ID:-2147483000}"
 
+# Runtime command names. These MUST be initialized before set -u code references
+# them (especially check_tools and the mysqlbinlog capture functions).
+MYSQL_CLIENT_BIN="${MYSQL_CLIENT_BIN:-mysql}"
+MYSQLBINLOG_BIN="${MYSQLBINLOG_BIN:-mysqlbinlog}"
+
+# Binary-log fetch mode:
+#   raw  = fetch from the MySQL server using mysqlbinlog
+#   copy = read from a mounted/local binlog directory
+BINLOG_FETCH_STRATEGY="${BINLOG_FETCH_STRATEGY:-raw}"
+BINLOG_LOCAL_DIR="${BINLOG_LOCAL_DIR:-}"
+
 # ---------------------------------------------------------------------------
 # Concurrency protection (distributed lock in object storage)
 # ---------------------------------------------------------------------------
