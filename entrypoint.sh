@@ -27,21 +27,6 @@ set_stage() {
   CURRENT_STAGE="$1"
 }
 
-# UTC timestamp helpers. Keep all persisted timestamps in UTC.
-now_utc() {
-  date -u +"%Y-%m-%dT%H:%M:%SZ"
-}
-
-now_epoch() {
-  date -u +%s
-}
-
-ts_to_epoch() {
-  local ts="$1"
-  date -u -d "$ts" +%s 2>/dev/null || printf '0'
-}
-
-
 # Report the current stage + the shell's exit status on exit. Never prints
 # secrets (it only reports the numeric status and the stage label).
 report_exit() {
@@ -94,15 +79,13 @@ R2_SECRET_ACCESS_KEY="${R2_SECRET_ACCESS_KEY:-}"
 R2_ENDPOINT="${R2_ENDPOINT:-}"
 R2_BUCKET="${R2_BUCKET:-}"
 R2_PATH="${R2_PATH:-mysql-backup}"
-RCLONE_CONFIG="${RCLONE_CONFIG:-/root/.config/rclone/rclone.conf}"
-RCLONE_CONFIG_DIR="${RCLONE_CONFIG_DIR:-$(dirname "$RCLONE_CONFIG")}"
 # S3 provider/ACL presented to rclone. The defaults target Cloudflare R2. They
 # are overridable so the SAME image can be validated against an S3-compatible
 # endpoint (e.g. MinIO in the integration harness) or pointed at another
 # provider without patching the script. Set R2_ACL="" to omit the acl option
 # entirely (some S3-compatible servers reject canned ACLs).
 R2_PROVIDER="${R2_PROVIDER:-Cloudflare}"
-R2_ACL="${R2_ACL-private}"
+R2_ACL="${R2_ACL:-private}"
 
 # PUPTracker reporting (REQUIRED). The job fails fast (non-zero, no backup) in
 # validate_env() if either variable is missing — we never run a backup that
@@ -166,17 +149,6 @@ BACKUP_TIMEZONE="${BACKUP_TIMEZONE:-UTC}"
 # Override MYSQLBINLOG_SERVER_ID per deployment so every consumer is distinct.
 MYSQLBINLOG_SERVER_ID="${MYSQLBINLOG_SERVER_ID:-2147483000}"
 
-# Runtime command names. These MUST be initialized before set -u code references
-# them (especially check_tools and the mysqlbinlog capture functions).
-MYSQL_CLIENT_BIN="${MYSQL_CLIENT_BIN:-mysql}"
-MYSQLBINLOG_BIN="${MYSQLBINLOG_BIN:-mysqlbinlog}"
-
-# Binary-log fetch mode:
-#   raw  = fetch from the MySQL server using mysqlbinlog
-#   copy = read from a mounted/local binlog directory
-BINLOG_FETCH_STRATEGY="${BINLOG_FETCH_STRATEGY:-raw}"
-BINLOG_LOCAL_DIR="${BINLOG_LOCAL_DIR:-}"
-
 # ---------------------------------------------------------------------------
 # Concurrency protection (distributed lock in object storage)
 # ---------------------------------------------------------------------------
@@ -194,12 +166,144 @@ BACKUP_LOCK_TTL_SECONDS="${BACKUP_LOCK_TTL_SECONDS:-21600}"  # 6h
 # the same `<bucket>/<path>` composition the backup UPLOAD paths use (see
 # upload_and_verify), so state, lock and backups always resolve to one bucket.
 BACKUP_LOCK_REMOTE="${R2_BUCKET}/${R2_PATH%/}/state/backup.lock"
+BACKUP_LOCK_HELD=0
+BACKUP_LOCK_TOKEN=""
+
+# ---------------------------------------------------------------------------
+# Binlog fetch strategy
+# ---------------------------------------------------------------------------
+# `raw`  (DEFAULT): pull an exact byte copy with
+#          `mysqlbinlog --read-from-remote-server --raw`.
+#          This is the standard, supported mechanism for a remote binlog
+#          consumer. The MySQL user needs the REPLICATION SLAVE privilege
+#          (read-only; it does not entitle the account to modify data).
+# `copy`: read the binlog files directly off the filesystem, for deployments
+#          where the server's binlog directory is mounted into this container
+#          (e.g. a shared volume). Requires BINLOG_LOCAL_DIR.
+#
+# Whichever strategy is used, the captured package is ALWAYS re-read locally
+# with mysqlbinlog before upload, so a truncated or unreadable capture can never
+# be uploaded as if it were a valid incremental.
+BINLOG_FETCH_STRATEGY="${BINLOG_FETCH_STRATEGY:-raw}"
+# Directory containing the server's binlog files, required by the `copy`
+# strategy only. Example: /var/lib/mysql
+BINLOG_LOCAL_DIR="${BINLOG_LOCAL_DIR:-}"
+
+# ---------------------------------------------------------------------------
+# Clock overrides (test seams)
+# ---------------------------------------------------------------------------
+# now_utc()/now_epoch()/ts_to_epoch() may be pre-defined by a sourcing test
+# harness to pin time. The defaults below are only installed when nothing else
+# has defined them, so production behaviour is unchanged.
+if ! declare -F now_utc >/dev/null 2>&1; then
+  # An ISO-8601 UTC timestamp (second precision). GNU date is assumed.
+  now_utc() { date -u +"%Y-%m-%dT%H:%M:%SZ"; }
+fi
+if ! declare -F now_epoch >/dev/null 2>&1; then
+  now_epoch() { date -u +%s; }
+fi
+if ! declare -F ts_to_epoch >/dev/null 2>&1; then
+  ts_to_epoch() { date -u -d "$1" +%s 2>/dev/null || echo 0; }
+fi
+
+# Local scratch directories.
+#   BACKUP_DIR   : the mydumper full-dump directory (also the upload root).
+#   BINLOG_DIR   : the incremental upload root, kept OUTSIDE BACKUP_DIR so a
+#                  full dump is never confused with an incremental archive.
+BACKUP_DIR="backup"
+BINLOG_DIR="binlog_archive"
+MYSQL_BINLOG_BASE_DIR="mysql_binlogs"
+# Default location of mysqlbinlog (installed via the Dockerfile). Overridable
+# for tests and unusual images.
+MYSQLBINLOG_BIN="${MYSQLBINLOG_BIN:-mysqlbinlog}"
+# MySQL client used for SHOW VARIABLES / SHOW BINARY LOGS / SHOW MASTER STATUS.
+MYSQL_CLIENT_BIN="${MYSQL_CLIENT_BIN:-mysql}"
+# Result of the binlog_format probe (ROW | STATEMENT | MIXED).
+BINLOG_FORMAT_PROBED=""
+# Remote (R2) path of the small JSON state object that drives the policy.
+# Bucket-qualified for the same reason as BACKUP_LOCK_REMOTE above: this object
+# must live beside the backups it describes, in the SAME bucket.
 BACKUP_STATE_REMOTE="${R2_BUCKET}/${R2_PATH%/}/state/backup_state.json"
 
+# ---------------------------------------------------------------------------
+# rclone config location
+# ---------------------------------------------------------------------------
+# We deliberately use an EXPLICIT config path (never relying on ~ / $HOME /
+# rclone's own home resolution, which can differ in minimal containers).
+# HOME may be unset or resolve differently inside the container, so default to
+# /root when unset and always mkdir -p the directory before writing.
+set_stage "load_config"
+if [[ -z "${HOME:-}" ]]; then
+  export HOME="/root"
+fi
+RCLONE_CONFIG="${RCLONE_CONFIG:-${HOME}/.config/rclone/rclone.conf}"
+export RCLONE_CONFIG
+# Tell rclone to always use our explicit file (belt-and-braces; RCLONE_CONFIG
+# env var is also honoured by rclone).
+RCLONE_CONFIG_DIR="$(dirname "$RCLONE_CONFIG")"
+export RCLONE_CONFIG_DIR
+set_stage "loaded_config"
 
 # ---------------------------------------------------------------------------
-# Restored runtime helpers
+# State for reporting (set as the run progresses)
 # ---------------------------------------------------------------------------
+BACKUP_NAME=""
+BACKUP_TYPE="daily_snapshot"
+DESTINATION="Cloudflare R2"
+STARTED_AT=""
+COMPLETED_AT=""
+BACKUP_SIZE=0
+FILE_COUNT=0
+CHECKSUM=""
+CHECKSUM_ALGORITHM="SHA-256"
+VERIFIED_AT=""
+STORAGE_PATH=""
+ERROR_MESSAGE=""
+
+# Incremental-specific report metadata (empty for FULL / daily_snapshot).
+BASE_BACKUP_NAME=""
+BASE_FULL_STORAGE_PATH=""
+BINLOG_FILE_START=""
+BINLOG_FILE_END=""
+BINLOG_POSITION_START=""
+BINLOG_POSITION_END=""
+
+# Per-stage return codes and anchor usability.
+#
+# WHY THESE EXIST: a backup is a CHAIN of stages, and each stage's return code
+# must never silently become (or be mistaken for) the job's exit status. A log
+# that shows only a final "status=1" is not diagnosable, because the failure
+# report ("status=failed") and the success report ("status=success") both come
+# back as HTTP 200 from the reporter. These globals are printed immediately
+# before the process exits so the exact failing stage is always explicit.
+FULL_BACKUP_RC="n/a"
+UPLOAD_RC="n/a"
+VERIFY_RC="n/a"
+REPORT_RC="n/a"
+STATE_UPDATE_RC="n/a"
+LOCK_RELEASE_RC="n/a"
+BINLOG_ANCHOR_OK="no"
+LAST_STAGE_STATUS="none"
+
+# Parsed backup state (the latest known SUCCESSFUL, VERIFIED full backup and the
+# incremental binlog boundary). Empty strings mean "unknown".
+STATE_PRESENT=0
+ST_LAST_FULL_NAME=""
+ST_LAST_FULL_COMPLETED_AT=""
+ST_LAST_FULL_STORAGE_PATH=""
+ST_LAST_BINLOG_FILE=""
+ST_LAST_BINLOG_POSITION=""
+ST_LAST_BINLOG_END_FILE=""
+ST_LAST_BINLOG_END_POSITION=""
+
+# Raw state object as retrieved from R2 (used to re-validate the lock owner just
+# before the state is advanced, so a stale lock takeover cannot interleave).
+ST_RAW_STATE=""
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
 log() {
   echo "[backup] $*"
 }
@@ -215,7 +319,6 @@ warn() {
 # Every stage that can influence the exit status is reported through here so the
 # log answers "which stage returned non-zero?" directly, instead of requiring an
 # operator to infer it from a single terminal status line.
-
 report_stage_rc() {
   local stage="$1"
   local rc="$2"
@@ -237,7 +340,6 @@ report_stage_rc() {
 #
 # The generated --defaults-file and rclone config are the one place real secrets
 # exist on disk; their CONTENTS are never printed by any diagnostic.
-
 redact_cmd() {
   local s="$*"
   local secret
@@ -266,7 +368,6 @@ redact_cmd() {
 # are surfaced, so this is safe to log.
 #
 #   log_binlog_anchor_diagnostics <dump-dir>
-
 log_binlog_anchor_diagnostics() {
   local dir="${1:-$BACKUP_DIR}"
   local meta="$dir/metadata"
@@ -310,7 +411,6 @@ log_binlog_anchor_diagnostics() {
 # the binlog anchor coordinates (none of which are credentials).
 #
 #   log_exit_diagnosis <final_status> [reason]
-
 log_exit_diagnosis() {
   local final_status="$1"
   local reason="${2:-}"
@@ -328,7 +428,6 @@ log_exit_diagnosis() {
 
 # Validate that all required configuration is present. Exits non-zero (without
 # attempting a backup) when a required variable is missing.
-
 validate_env() {
   local missing=0
 
@@ -367,7 +466,6 @@ validate_env() {
 # Verify every external command this script relies on is actually present in
 # the image. Fail fast (before touching MySQL/R2) with a clear, non-secret
 # message naming the missing command.
-
 check_tools() {
   local missing=0
   local tool
@@ -426,71 +524,6 @@ check_tools() {
 # time by defining now_utc()/now_epoch()/ts_to_epoch() before sourcing.
 
 # Escape a string for safe inclusion inside a double-quoted JSON string value.
-
-report_failure_and_exit() {
-  local message="$1"
-  local code="${2:-1}"
-
-  COMPLETED_AT="$(now_utc)"
-  ERROR_MESSAGE="$(printf '%s' "$message" | head -c 1900)"
-
-  safe_log_error "$message"
-  log "Attempting to report backup failure to PUPTracker..."
-
-  # report_now returns non-zero when the report itself cannot be delivered. That
-  # return code must NOT replace the caller's intended exit code: the job failed
-  # for $message's reason, not because the failure report bounced.
-  local report_rc=0
-  report_now "failed" || report_rc=$?
-  if [[ "$report_rc" -ne 0 ]]; then
-    warn "Could not deliver failure report to PUPTracker (backup already failed)."
-  fi
-  REPORT_RC="$report_rc"
-
-  log_exit_diagnosis "failed" "${message}"
-  exit "$code"
-}
-
-# ---------------------------------------------------------------------------
-# Backup state (R2 JSON object) — the single source of truth for the policy
-# ---------------------------------------------------------------------------
-# The container has NO direct access to the PUPTracker database, so backup
-# state is persisted as a small JSON object in R2 at:
-#     <R2_BUCKET>/<R2_PATH>/state/backup_state.json
-#
-# The bucket component is REQUIRED. rclone addresses an object as
-# `remote:<bucket>/<key>`, so omitting the bucket silently retargets the state
-# object into a different bucket than the backups it tracks.
-#
-# It records the latest SUCCESSFUL, VERIFIED full backup and the incremental
-# binlog boundary. It is ONLY advanced after a run has: completed, uploaded,
-# passed R2 verification, AND been reported to PUPTracker (see update_state).
-#
-# JSON is read/parsed with sed (no jq dependency). Every value is a string or
-# integer, never a secret.
-
-# ---------------------------------------------------------------------------
-# Distributed lock (object storage) — protects the incremental state
-# ---------------------------------------------------------------------------
-# The state object is READ-MODIFY-WRITE. Without mutual exclusion, two runs can
-# both read the same "last end position", both capture overlapping binlog
-# ranges, and both write state — producing duplicate/overlapping archives and a
-# state value that does not reflect what is actually in R2.
-#
-# Two layers are used:
-#   1. `rclone copyto` does NOT overwrite an existing object, so creating the
-#      lock object is an atomic create-if-absent (test-and-set) in R2.
-#   2. A LOCAL best-effort mkdir lock keeps a single container from racing
-#      itself during the create-check window.
-#
-# The lock object contains an expiry timestamp (now + BACKUP_LOCK_TTL_SECONDS)
-# and a random token. An EXPIRED lock is treated as stale and taken over, so a
-# crashed run can never permanently wedge the chain. The token is re-checked
-# immediately before the state is advanced; if it no longer matches, another run
-# took the lock over and this run aborts WITHOUT touching state.
-
-# Read the "expires_at" epoch from the lock object; prints 0 when unreadable.
-
 json_escape() {
   local s="$1"
   s="${s//\\/\\\\}"
@@ -504,274 +537,21 @@ json_escape() {
 }
 
 # Log a "safe" failure: never include credentials/tokens/passwords.
-
-lock_expiry_epoch() {
-  local raw
-  raw="$(rclone --config "${RCLONE_CONFIG:-}" cat "remote:${BACKUP_LOCK_REMOTE}" 2>/dev/null || true)"
-  [[ -z "$raw" ]] && { printf '0'; return 0; }
-  printf '%s' "$raw" | sed -n 's/.*"expires_at_epoch"[[:space:]]*:[[:space:]]*\([0-9][0-9]*\).*/\1/p' | head -n1
-  return 0
+safe_log_error() {
+  local raw="$1"
+  warn "$raw"
 }
 
-# Print the token recorded in the lock object (empty when unreadable).
-
-lock_token() {
-  local raw
-  raw="$(rclone --config "${RCLONE_CONFIG:-}" cat "remote:${BACKUP_LOCK_REMOTE}" 2>/dev/null || true)"
-  [[ -z "$raw" ]] && return 0
-  printf '%s' "$raw" | sed -n 's/.*"token"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -n1
-  return 0
-}
-
-# Acquire the distributed lock. Returns 0 when held, 1 when another live run
-# holds it. Never exits: the caller decides how to react.
-
-acquire_lock() {
-  BACKUP_LOCK_HELD=0
-  BACKUP_LOCK_TOKEN=""
-
-  if [[ "${BACKUP_LOCK_ENABLED:-true}" != "true" ]]; then
-    log "Distributed lock disabled (BACKUP_LOCK_ENABLED=false)."
-    return 0
-  fi
-
-  local token="${BACKUP_LOCK_TOKEN_PREFIX:-}${RANDOM}${RANDOM}-$(now_epoch)-$$"
-  local ttl="${BACKUP_LOCK_TTL_SECONDS:-21600}"
-  [[ "$ttl" =~ ^[0-9]+$ ]] || ttl=21600
-  local now expires payload attempts=0
-  local held_expiry held_token lock_age
-
-  log "LOCK-DIAGNOSTIC: enabled=true"
-  log "LOCK-DIAGNOSTIC: ttl_seconds=${ttl}"
-  log "LOCK-DIAGNOSTIC: lock_remote=remote:${BACKUP_LOCK_REMOTE}"
-
-  while :; do
-    attempts=$((attempts + 1))
-    now="$(now_epoch)"
-    expires=$((now + ttl))
-
-    # ------------------------------------------------------------
-    # Diagnostic: inspect an existing lock BEFORE trying to acquire.
-    # This prints only timestamps/status, never the lock token.
-    # ------------------------------------------------------------
-    held_expiry="$(lock_expiry_epoch)"
-
-    if [[ "${held_expiry:-0}" =~ ^[0-9]+$ ]] && [[ "$held_expiry" -gt 0 ]]; then
-      lock_age=$((now - held_expiry))
-
-      if [[ "$held_expiry" -le "$now" ]]; then
-        log "LOCK-DIAGNOSTIC: existing lock=STALE"
-        log "LOCK-DIAGNOSTIC: current_epoch=${now}"
-        log "LOCK-DIAGNOSTIC: expires_epoch=${held_expiry}"
-        log "LOCK-DIAGNOSTIC: expired_seconds_ago=${lock_age#-}"
-      else
-        log "LOCK-DIAGNOSTIC: existing lock=ACTIVE"
-        log "LOCK-DIAGNOSTIC: current_epoch=${now}"
-        log "LOCK-DIAGNOSTIC: expires_epoch=${held_expiry}"
-        log "LOCK-DIAGNOSTIC: seconds_until_expiry=$((held_expiry - now))"
-      fi
-    else
-      log "LOCK-DIAGNOSTIC: existing lock=NOT_READABLE_OR_MISSING"
-      log "LOCK-DIAGNOSTIC: current_epoch=${now}"
-    fi
-
-    tmp="$(mktemp)"
-
-    printf '{
-  "holder": "%s",
-  "token": "%s",
-  "acquired_at_epoch": %s,
-  "expires_at_epoch": %s
-}
-' \
-      "$(json_escape "${HOSTNAME:-unknown}")" \
-      "$(json_escape "$token")" \
-      "$now" \
-      "$expires" > "$tmp"
-
-    payload="$tmp"
-
-    # Atomic create-if-absent.
-    if rclone --config "${RCLONE_CONFIG:-}" copyto \
-        "$payload" \
-        "remote:${BACKUP_LOCK_REMOTE}" >/dev/null 2>&1; then
-
-      rm -f "$payload"
-
-      # Confirm that the lock contains OUR token.
-      if [[ "$(lock_token)" == "$token" ]]; then
-        BACKUP_LOCK_HELD=1
-        BACKUP_LOCK_TOKEN="$token"
-
-        log "LOCK-DIAGNOSTIC: acquisition=SUCCESS"
-        log "LOCK-DIAGNOSTIC: acquired_epoch=${now}"
-        log "LOCK-DIAGNOSTIC: expires_epoch=${expires}"
-        log "Acquired distributed backup lock (expires in ${ttl}s)."
-
-        return 0
-      fi
-
-      warn "LOCK-DIAGNOSTIC: write succeeded but ownership verification failed."
-      warn "Lock write was not acknowledged as ours; retrying lock acquisition."
-
-    else
-      rm -f "$payload"
-
-      held_expiry="$(lock_expiry_epoch)"
-
-      if [[ "${held_expiry:-0}" =~ ^[0-9]+$ ]] \
-          && [[ "${held_expiry:-0}" -gt 0 ]] \
-          && [[ "$held_expiry" -le "$now" ]]; then
-
-        warn "LOCK-DIAGNOSTIC: stale lock detected."
-        warn "LOCK-DIAGNOSTIC: current_epoch=${now}"
-        warn "LOCK-DIAGNOSTIC: expires_epoch=${held_expiry}"
-        warn "LOCK-DIAGNOSTIC: deleting stale lock and retrying."
-
-        rclone --config "${RCLONE_CONFIG:-}" \
-          deletefile "remote:${BACKUP_LOCK_REMOTE}" >/dev/null 2>&1 || true
-
-      else
-
-        warn "LOCK-DIAGNOSTIC: lock acquisition failed and lock is still ACTIVE or unreadable."
-
-        if [[ "${held_expiry:-0}" =~ ^[0-9]+$ ]] && [[ "${held_expiry:-0}" -gt 0 ]]; then
-          warn "LOCK-DIAGNOSTIC: current_epoch=${now}"
-          warn "LOCK-DIAGNOSTIC: expires_epoch=${held_expiry}"
-          warn "LOCK-DIAGNOSTIC: seconds_until_expiry=$((held_expiry - now))"
-        else
-          warn "LOCK-DIAGNOSTIC: expires_epoch=unavailable"
-          warn "LOCK-DIAGNOSTIC: possible causes include unreadable lock object or rclone/R2 error."
-        fi
-      fi
-    fi
-
-    if [[ "$attempts" -ge 2 ]]; then
-      warn "LOCK-DIAGNOSTIC: acquisition attempts exhausted."
-      return 1
-    fi
-  done
-}
-
-# Release the lock, but ONLY when we are still its owner (a stale take-over by
-# another run must not have its lock deleted by us).
-
-build_payload() {
-  local status="$1"
-  local json
-
-  json="{"
-  json+="\"status\":\"$(json_escape "$status")\","
-  json+="\"backup_name\":\"$(json_escape "$BACKUP_NAME")\","
-  json+="\"backup_type\":\"$(json_escape "$BACKUP_TYPE")\","
-  json+="\"started_at\":\"$(json_escape "$STARTED_AT")\","
-  json+="\"completed_at\":\"$(json_escape "$COMPLETED_AT")\","
-  json+="\"destination\":\"$(json_escape "$DESTINATION")\""
-
-  if [[ "$status" == "failed" ]]; then
-    if [[ -n "$ERROR_MESSAGE" ]]; then
-      json+=",\"error_message\":\"$(json_escape "$ERROR_MESSAGE")\""
-    fi
-  else
-    json+=",\"backup_size\":${BACKUP_SIZE:-0}"
-    json+=",\"file_count\":${FILE_COUNT:-0}"
-    json+=",\"checksum\":\"$(json_escape "$CHECKSUM")\""
-    json+=",\"checksum_algorithm\":\"$(json_escape "$CHECKSUM_ALGORITHM")\""
-    if [[ -n "$VERIFIED_AT" ]]; then
-      json+=",\"verified_at\":\"$(json_escape "$VERIFIED_AT")\""
-    fi
-    if [[ -n "$STORAGE_PATH" ]]; then
-      json+=",\"storage_path\":\"$(json_escape "$STORAGE_PATH")\""
-    fi
-
-    # Recovery-chain metadata for TRUE incrementals. Only emitted when present
-    # so FULL / daily_snapshot payloads are byte-for-byte unchanged.
-    #
-    # NOTE: base_backup_name maps to PUPTracker's nullable `parent_backup_id`
-    # relationship only by NAME on the reporter side; the webhook accepts the
-    # binlog_* fields directly (see BackupHistoryController). We send the
-    # base backup's NAME (human-meaningful for restore) plus the binlog
-    # boundary, and never invent values.
-    if [[ -n "$BASE_BACKUP_NAME" ]]; then
-      json+=",\"base_backup_name\":\"$(json_escape "$BASE_BACKUP_NAME")\""
-    fi
-    if [[ -n "$BASE_FULL_STORAGE_PATH" ]]; then
-      json+=",\"base_full_storage_path\":\"$(json_escape "$BASE_FULL_STORAGE_PATH")\""
-    fi
-    if [[ -n "$BINLOG_FILE_START" ]]; then
-      json+=",\"binlog_file_start\":\"$(json_escape "$BINLOG_FILE_START")\""
-    fi
-    if [[ -n "$BINLOG_POSITION_START" ]]; then
-      json+=",\"binlog_position_start\":${BINLOG_POSITION_START}"
-    fi
-    if [[ -n "$BINLOG_FILE_END" ]]; then
-      json+=",\"binlog_file_end\":\"$(json_escape "$BINLOG_FILE_END")\""
-    fi
-    if [[ -n "$BINLOG_POSITION_END" ]]; then
-      json+=",\"binlog_position_end\":${BINLOG_POSITION_END}"
-    fi
-  fi
-
-  json+="}"
-  printf '%s' "$json"
-}
-
-# ---------------------------------------------------------------------------
-# Metadata helpers
-# ---------------------------------------------------------------------------
-# Each helper takes an optional directory argument (defaulting to $BACKUP_DIR,
-# the full-dump root) so the SAME deterministic metadata/checksum logic is used
-# for a FULL dump and for an incremental binlog archive.
-
-# Count files (not directories) under the given directory.
-
-compute_manifest_checksum() {
-  local dir="${1:-$BACKUP_DIR}"
-  local manifest
-  local aggregate
-  manifest="$(mktemp)"
-
-  # Build the manifest: hash + two-space separator + relative path.
-  (
-    cd "$dir"
-    find . -type f -print0 2>/dev/null | sort -z \
-      | while IFS= read -r -d '' f; do
-          rel="${f#./}"
-          printf '%s  %s\n' "$(sha256sum "$f" | awk '{print $1}')" "$rel"
-        done
-  ) > "$manifest"
-
-  aggregate="$(sha256sum "$manifest" | awk '{print $1}')"
-  rm -f "$manifest"
-  printf '%s' "$aggregate"
-}
-
-# Verify that the R2 upload is present and complete by comparing the LOCAL
-# object count and TOTAL BYTES against what rclone reports at the destination.
+# Send the current report state to PUPTracker. Returns 0 on an accepted
+# (2xx) response, non-zero otherwise. Never prints the token or headers.
 #
-# Scope / honesty:
-#   - `rclone size --json` returns the authoritative remote object count and
-#     total bytes for the S3/R2 backend, but it does NOT expose a
-#     cryptographically trustworthy remote hash of every object without an
-#     extra HEAD/GET round trip (R2 does not surface the same ETag guarantees
-#     as other S3 providers for multipart uploads).
-#   - This check therefore verifies OBJECT PRESENCE + COUNT + TOTAL SIZE
-#     (i.e. nothing is missing or truncated), NOT full cryptographic
-#     verification of the remote copy.
-#   - The authoritative integrity digest remains the LOCAL manifest SHA-256
-#     (reported to PUPTracker as `checksum`). It is NOT claimed here to have
-#     been independently re-derived from the remote bytes.
+#   report_now <status>   e.g. report_now success | report_now failed
 #
-# Returns 0 when the remote count and total size both match the local values.
-#   verify_upload [<local_dir>] [<remote_path>]
-
-count_files() {
-  local dir="${1:-$BACKUP_DIR}"
-  find "$dir" -type f 2>/dev/null | wc -l
-}
-
-# Total size in bytes of all files under the given directory.
-
+# On success sets REPORT_LAST_HTTP_CODE and clears REPORT_CONFLICT=0. On a 409
+# (the reporter refused the payload as an integrity conflict) it sets
+# REPORT_CONFLICT=1 so the caller can return the distinct exit code.
+REPORT_LAST_HTTP_CODE=""
+REPORT_CONFLICT=0
 report_now() {
   local status="$1"
   local http_code
@@ -842,23 +622,80 @@ report_now() {
 }
 
 # Build the JSON payload for the current state.
+build_payload() {
+  local status="$1"
+  local json
 
-safe_log_error() {
-  local raw="$1"
-  warn "$raw"
+  json="{"
+  json+="\"status\":\"$(json_escape "$status")\","
+  json+="\"backup_name\":\"$(json_escape "$BACKUP_NAME")\","
+  json+="\"backup_type\":\"$(json_escape "$BACKUP_TYPE")\","
+  json+="\"started_at\":\"$(json_escape "$STARTED_AT")\","
+  json+="\"completed_at\":\"$(json_escape "$COMPLETED_AT")\","
+  json+="\"destination\":\"$(json_escape "$DESTINATION")\""
+
+  if [[ "$status" == "failed" ]]; then
+    if [[ -n "$ERROR_MESSAGE" ]]; then
+      json+=",\"error_message\":\"$(json_escape "$ERROR_MESSAGE")\""
+    fi
+  else
+    json+=",\"backup_size\":${BACKUP_SIZE:-0}"
+    json+=",\"file_count\":${FILE_COUNT:-0}"
+    json+=",\"checksum\":\"$(json_escape "$CHECKSUM")\""
+    json+=",\"checksum_algorithm\":\"$(json_escape "$CHECKSUM_ALGORITHM")\""
+    if [[ -n "$VERIFIED_AT" ]]; then
+      json+=",\"verified_at\":\"$(json_escape "$VERIFIED_AT")\""
+    fi
+    if [[ -n "$STORAGE_PATH" ]]; then
+      json+=",\"storage_path\":\"$(json_escape "$STORAGE_PATH")\""
+    fi
+
+    # Recovery-chain metadata for TRUE incrementals. Only emitted when present
+    # so FULL / daily_snapshot payloads are byte-for-byte unchanged.
+    #
+    # NOTE: base_backup_name maps to PUPTracker's nullable `parent_backup_id`
+    # relationship only by NAME on the reporter side; the webhook accepts the
+    # binlog_* fields directly (see BackupHistoryController). We send the
+    # base backup's NAME (human-meaningful for restore) plus the binlog
+    # boundary, and never invent values.
+    if [[ -n "$BASE_BACKUP_NAME" ]]; then
+      json+=",\"base_backup_name\":\"$(json_escape "$BASE_BACKUP_NAME")\""
+    fi
+    if [[ -n "$BASE_FULL_STORAGE_PATH" ]]; then
+      json+=",\"base_full_storage_path\":\"$(json_escape "$BASE_FULL_STORAGE_PATH")\""
+    fi
+    if [[ -n "$BINLOG_FILE_START" ]]; then
+      json+=",\"binlog_file_start\":\"$(json_escape "$BINLOG_FILE_START")\""
+    fi
+    if [[ -n "$BINLOG_POSITION_START" ]]; then
+      json+=",\"binlog_position_start\":${BINLOG_POSITION_START}"
+    fi
+    if [[ -n "$BINLOG_FILE_END" ]]; then
+      json+=",\"binlog_file_end\":\"$(json_escape "$BINLOG_FILE_END")\""
+    fi
+    if [[ -n "$BINLOG_POSITION_END" ]]; then
+      json+=",\"binlog_position_end\":${BINLOG_POSITION_END}"
+    fi
+  fi
+
+  json+="}"
+  printf '%s' "$json"
 }
 
-# Send the current report state to PUPTracker. Returns 0 on an accepted
-# (2xx) response, non-zero otherwise. Never prints the token or headers.
-#
-#   report_now <status>   e.g. report_now success | report_now failed
-#
-# On success sets REPORT_LAST_HTTP_CODE and clears REPORT_CONFLICT=0. On a 409
-# (the reporter refused the payload as an integrity conflict) it sets
-# REPORT_CONFLICT=1 so the caller can return the distinct exit code.
-REPORT_LAST_HTTP_CODE=""
-REPORT_CONFLICT=0
+# ---------------------------------------------------------------------------
+# Metadata helpers
+# ---------------------------------------------------------------------------
+# Each helper takes an optional directory argument (defaulting to $BACKUP_DIR,
+# the full-dump root) so the SAME deterministic metadata/checksum logic is used
+# for a FULL dump and for an incremental binlog archive.
 
+# Count files (not directories) under the given directory.
+count_files() {
+  local dir="${1:-$BACKUP_DIR}"
+  find "$dir" -type f 2>/dev/null | wc -l
+}
+
+# Total size in bytes of all files under the given directory.
 total_size() {
   local dir="${1:-$BACKUP_DIR}"
   find "$dir" -type f -printf "%s\n" 2>/dev/null | awk '{ s += $1 } END { print s+0 }'
@@ -869,7 +706,45 @@ total_size() {
 #   MANIFEST LINE FORMAT:  <sha256 of file>  <relative path>
 #
 # The manifest is sorted by relative path so the result is reproducible.
+compute_manifest_checksum() {
+  local dir="${1:-$BACKUP_DIR}"
+  local manifest
+  local aggregate
+  manifest="$(mktemp)"
 
+  # Build the manifest: hash + two-space separator + relative path.
+  (
+    cd "$dir"
+    find . -type f -print0 2>/dev/null | sort -z \
+      | while IFS= read -r -d '' f; do
+          rel="${f#./}"
+          printf '%s  %s\n' "$(sha256sum "$f" | awk '{print $1}')" "$rel"
+        done
+  ) > "$manifest"
+
+  aggregate="$(sha256sum "$manifest" | awk '{print $1}')"
+  rm -f "$manifest"
+  printf '%s' "$aggregate"
+}
+
+# Verify that the R2 upload is present and complete by comparing the LOCAL
+# object count and TOTAL BYTES against what rclone reports at the destination.
+#
+# Scope / honesty:
+#   - `rclone size --json` returns the authoritative remote object count and
+#     total bytes for the S3/R2 backend, but it does NOT expose a
+#     cryptographically trustworthy remote hash of every object without an
+#     extra HEAD/GET round trip (R2 does not surface the same ETag guarantees
+#     as other S3 providers for multipart uploads).
+#   - This check therefore verifies OBJECT PRESENCE + COUNT + TOTAL SIZE
+#     (i.e. nothing is missing or truncated), NOT full cryptographic
+#     verification of the remote copy.
+#   - The authoritative integrity digest remains the LOCAL manifest SHA-256
+#     (reported to PUPTracker as `checksum`). It is NOT claimed here to have
+#     been independently re-derived from the remote bytes.
+#
+# Returns 0 when the remote count and total size both match the local values.
+#   verify_upload [<local_dir>] [<remote_path>]
 verify_upload() {
   local dir="${1:-$BACKUP_DIR}"
   local remote_path="${2:-${R2_BUCKET}/${STORAGE_PATH}}"
@@ -921,6 +796,208 @@ verify_upload() {
 # Attempt to send a failure report when a stage fails. We deliberately do NOT
 # use `trap ... EXIT` for the success path because success reporting must only
 # happen after verification and must be explicit.
+report_failure_and_exit() {
+  local message="$1"
+  local code="${2:-1}"
+
+  COMPLETED_AT="$(now_utc)"
+  ERROR_MESSAGE="$(printf '%s' "$message" | head -c 1900)"
+
+  safe_log_error "$message"
+  log "Attempting to report backup failure to PUPTracker..."
+
+  # report_now returns non-zero when the report itself cannot be delivered. That
+  # return code must NOT replace the caller's intended exit code: the job failed
+  # for $message's reason, not because the failure report bounced.
+  local report_rc=0
+  report_now "failed" || report_rc=$?
+  if [[ "$report_rc" -ne 0 ]]; then
+    warn "Could not deliver failure report to PUPTracker (backup already failed)."
+  fi
+  REPORT_RC="$report_rc"
+
+  log_exit_diagnosis "failed" "${message}"
+  exit "$code"
+}
+
+# ---------------------------------------------------------------------------
+# Backup state (R2 JSON object) — the single source of truth for the policy
+# ---------------------------------------------------------------------------
+# The container has NO direct access to the PUPTracker database, so backup
+# state is persisted as a small JSON object in R2 at:
+#     <R2_BUCKET>/<R2_PATH>/state/backup_state.json
+#
+# The bucket component is REQUIRED. rclone addresses an object as
+# `remote:<bucket>/<key>`, so omitting the bucket silently retargets the state
+# object into a different bucket than the backups it tracks.
+#
+# It records the latest SUCCESSFUL, VERIFIED full backup and the incremental
+# binlog boundary. It is ONLY advanced after a run has: completed, uploaded,
+# passed R2 verification, AND been reported to PUPTracker (see update_state).
+#
+# JSON is read/parsed with sed (no jq dependency). Every value is a string or
+# integer, never a secret.
+
+# ---------------------------------------------------------------------------
+# Distributed lock (object storage) — protects the incremental state
+# ---------------------------------------------------------------------------
+# The state object is READ-MODIFY-WRITE. Without mutual exclusion, two runs can
+# both read the same "last end position", both capture overlapping binlog
+# ranges, and both write state — producing duplicate/overlapping archives and a
+# state value that does not reflect what is actually in R2.
+#
+# Two layers are used:
+#   1. `rclone copyto` does NOT overwrite an existing object, so creating the
+#      lock object is an atomic create-if-absent (test-and-set) in R2.
+#   2. A LOCAL best-effort mkdir lock keeps a single container from racing
+#      itself during the create-check window.
+#
+# The lock object contains an expiry timestamp (now + BACKUP_LOCK_TTL_SECONDS)
+# and a random token. An EXPIRED lock is treated as stale and taken over, so a
+# crashed run can never permanently wedge the chain. The token is re-checked
+# immediately before the state is advanced; if it no longer matches, another run
+# took the lock over and this run aborts WITHOUT touching state.
+
+# Read the "expires_at" epoch from the lock object; prints 0 when unreadable.
+lock_expiry_epoch() {
+  local raw
+  raw="$(rclone --config "${RCLONE_CONFIG:-}" cat "remote:${BACKUP_LOCK_REMOTE}" 2>/dev/null || true)"
+  [[ -z "$raw" ]] && { printf '0'; return 0; }
+  printf '%s' "$raw" | sed -n 's/.*"expires_at_epoch"[[:space:]]*:[[:space:]]*\([0-9][0-9]*\).*/\1/p' | head -n1
+  return 0
+}
+
+# Print the token recorded in the lock object (empty when unreadable).
+lock_token() {
+  local raw
+  raw="$(rclone --config "${RCLONE_CONFIG:-}" cat "remote:${BACKUP_LOCK_REMOTE}" 2>/dev/null || true)"
+  [[ -z "$raw" ]] && return 0
+  printf '%s' "$raw" | sed -n 's/.*"token"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -n1
+  return 0
+}
+
+# Acquire the distributed lock. Returns 0 when held, 1 when another live run
+# holds it. Never exits: the caller decides how to react.
+acquire_lock() {
+  BACKUP_LOCK_HELD=0
+  BACKUP_LOCK_TOKEN=""
+
+  if [[ "${BACKUP_LOCK_ENABLED:-true}" != "true" ]]; then
+    log "Distributed lock disabled (BACKUP_LOCK_ENABLED=false)."
+    return 0
+  fi
+
+  local token="${BACKUP_LOCK_TOKEN_PREFIX:-}${RANDOM}${RANDOM}-$(now_epoch)-$$"
+  local ttl="${BACKUP_LOCK_TTL_SECONDS:-21600}"
+  [[ "$ttl" =~ ^[0-9]+$ ]] || ttl=21600
+  local now expires payload attempts=0
+  local held_expiry held_token lock_age
+
+  log "LOCK-DIAGNOSTIC: enabled=true"
+  log "LOCK-DIAGNOSTIC: ttl_seconds=${ttl}"
+  log "LOCK-DIAGNOSTIC: lock_remote=remote:${BACKUP_LOCK_REMOTE}"
+
+  while :; do
+    attempts=$((attempts + 1))
+    now="$(now_epoch)"
+    expires=$((now + ttl))
+
+    # ------------------------------------------------------------
+    # Diagnostic: inspect an existing lock BEFORE trying to acquire.
+    # This prints only timestamps/status, never the lock token.
+    # ------------------------------------------------------------
+    held_expiry="$(lock_expiry_epoch)"
+
+    if [[ "${held_expiry:-0}" =~ ^[0-9]+$ ]] && [[ "$held_expiry" -gt 0 ]]; then
+      lock_age=$((now - held_expiry))
+
+      if [[ "$held_expiry" -le "$now" ]]; then
+        log "LOCK-DIAGNOSTIC: existing lock=STALE"
+        log "LOCK-DIAGNOSTIC: current_epoch=${now}"
+        log "LOCK-DIAGNOSTIC: expires_epoch=${held_expiry}"
+        log "LOCK-DIAGNOSTIC: expired_seconds_ago=${lock_age#-}"
+      else
+        log "LOCK-DIAGNOSTIC: existing lock=ACTIVE"
+        log "LOCK-DIAGNOSTIC: current_epoch=${now}"
+        log "LOCK-DIAGNOSTIC: expires_epoch=${held_expiry}"
+        log "LOCK-DIAGNOSTIC: seconds_until_expiry=$((held_expiry - now))"
+      fi
+    else
+      log "LOCK-DIAGNOSTIC: existing lock=NOT_READABLE_OR_MISSING"
+      log "LOCK-DIAGNOSTIC: current_epoch=${now}"
+    fi
+
+    tmp="$(mktemp)"
+
+    printf '{\n  "holder": "%s",\n  "token": "%s",\n  "acquired_at_epoch": %s,\n  "expires_at_epoch": %s\n}\n' \
+      "$(json_escape "${HOSTNAME:-unknown}")" \
+      "$(json_escape "$token")" \
+      "$now" \
+      "$expires" > "$tmp"
+
+    payload="$tmp"
+
+    # Atomic create-if-absent.
+    if rclone --config "${RCLONE_CONFIG:-}" copyto \
+        "$payload" \
+        "remote:${BACKUP_LOCK_REMOTE}" >/dev/null 2>&1; then
+
+      rm -f "$payload"
+
+      # Confirm that the lock contains OUR token.
+      if [[ "$(lock_token)" == "$token" ]]; then
+        BACKUP_LOCK_HELD=1
+        BACKUP_LOCK_TOKEN="$token"
+
+        log "LOCK-DIAGNOSTIC: acquisition=SUCCESS"
+        log "LOCK-DIAGNOSTIC: acquired_epoch=${now}"
+        log "LOCK-DIAGNOSTIC: expires_epoch=${expires}"
+        log "Acquired distributed backup lock (expires in ${ttl}s)."
+
+        return 0
+      fi
+
+      warn "LOCK-DIAGNOSTIC: write succeeded but ownership verification failed."
+      warn "Lock write was not acknowledged as ours; retrying lock acquisition."
+
+    else
+      rm -f "$payload"
+
+      held_expiry="$(lock_expiry_epoch)"
+
+      if [[ "${held_expiry:-0}" =~ ^[0-9]+$ ]] \
+          && [[ "${held_expiry:-0}" -gt 0 ]] \
+          && [[ "$held_expiry" -le "$now" ]]; then
+
+        warn "LOCK-DIAGNOSTIC: stale lock detected."
+        warn "LOCK-DIAGNOSTIC: current_epoch=${now}"
+        warn "LOCK-DIAGNOSTIC: expires_epoch=${held_expiry}"
+        warn "LOCK-DIAGNOSTIC: deleting stale lock and retrying."
+
+        rclone --config "${RCLONE_CONFIG:-}" \
+          deletefile "remote:${BACKUP_LOCK_REMOTE}" >/dev/null 2>&1 || true
+
+      else
+
+        warn "LOCK-DIAGNOSTIC: lock acquisition failed and lock is still ACTIVE or unreadable."
+
+        if [[ "${held_expiry:-0}" =~ ^[0-9]+$ ]] && [[ "${held_expiry:-0}" -gt 0 ]]; then
+          warn "LOCK-DIAGNOSTIC: current_epoch=${now}"
+          warn "LOCK-DIAGNOSTIC: expires_epoch=${held_expiry}"
+          warn "LOCK-DIAGNOSTIC: seconds_until_expiry=$((held_expiry - now))"
+        else
+          warn "LOCK-DIAGNOSTIC: expires_epoch=unavailable"
+          warn "LOCK-DIAGNOSTIC: possible causes include unreadable lock object or rclone/R2 error."
+        fi
+      fi
+    fi
+
+    if [[ "$attempts" -ge 2 ]]; then
+      warn "LOCK-DIAGNOSTIC: acquisition attempts exhausted."
+      return 1
+    fi
+  done
+}
 
 # Release the lock, but ONLY when we are still its owner (a stale take-over by
 # another run must not have its lock deleted by us).
@@ -1107,10 +1184,10 @@ determine_backup_type() {
     return 0
   fi
 
-  # An anchorless FULL cannot safely start a TRUE_INCREMENTAL chain.
-  # Automatically recover by taking a new FULL now rather than waiting for
-  # BACKUP_FULL_INTERVAL_DAYS. The new FULL must obtain and persist a binlog
-  # anchor before incrementals can resume.
+  # A TRUE incremental requires a known-good file+position boundary from the
+  # last successful FULL (or the most recent successful incremental). If the
+  # persisted FULL has no usable anchor, establish a new safe FULL base rather
+  # than guessing where the incremental stream should begin.
   if [[ "${BACKUP_BINLOG_ENABLED:-true}" == "true" ]] &&      [[ -z "${ST_LAST_BINLOG_FILE:-}" || -z "${ST_LAST_BINLOG_POSITION:-}" ]]; then
     warn "Last successful FULL '${ST_LAST_FULL_NAME}' has no usable binlog anchor; forcing a new FULL to establish a safe incremental base."
     DECIDED_TYPE="full"
