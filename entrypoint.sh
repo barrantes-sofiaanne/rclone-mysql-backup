@@ -27,6 +27,21 @@ set_stage() {
   CURRENT_STAGE="$1"
 }
 
+# UTC timestamp helpers. Keep all persisted timestamps in UTC.
+now_utc() {
+  date -u +"%Y-%m-%dT%H:%M:%SZ"
+}
+
+now_epoch() {
+  date -u +%s
+}
+
+ts_to_epoch() {
+  local ts="$1"
+  date -u -d "$ts" +%s 2>/dev/null || printf '0'
+}
+
+
 # Report the current stage + the shell's exit status on exit. Never prints
 # secrets (it only reports the numeric status and the stage label).
 report_exit() {
