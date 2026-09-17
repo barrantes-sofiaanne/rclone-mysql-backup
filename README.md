@@ -136,7 +136,7 @@ state) and an **end** (read from the server at capture time).
 ### MySQL 8.4: how the FULL anchor is obtained
 
 MySQL **8.4 removed `SHOW MASTER STATUS`** in favour of `SHOW BINARY LOG STATUS`.
-That makes the snapshot anchor dependent on *which statement the dumper issues*,
+That makes the snapshot anchor dependent on _which statement the dumper issues_,
 and the pinned `mydumper/mydumper:v0.21.3-2` picks between them by classifying
 the server from `@@version_comment` / `@@version`:
 
@@ -172,7 +172,7 @@ MariaDB/Percona builds instead of pinning one vendor's version into the image.
 > incremental refuses to run).
 
 The `raw` capture path likewise uses the **MySQL** client's portable form. The
-`--result-dir` option is *MariaDB-only* — MySQL's `mysqlbinlog` rejects it with
+`--result-dir` option is _MariaDB-only_ — MySQL's `mysqlbinlog` rejects it with
 `unknown option '--result-dir'` — so the container runs `mysqlbinlog` with the
 destination directory as its working directory and lets it create a file named
 after the binlog.
