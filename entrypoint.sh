@@ -1650,6 +1650,7 @@ EOF
         --port "$MYSQL_PORT" \
         --database "$MYSQL_DATABASE" \
         # --source-data \
+        
         "${sv_args[@]}" \
         -C -c --clear -o "$BACKUP_DIR")"
   mydumper \
