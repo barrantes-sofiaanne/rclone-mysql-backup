@@ -85,7 +85,7 @@ R2_PATH="${R2_PATH:-mysql-backup}"
 # provider without patching the script. Set R2_ACL="" to omit the acl option
 # entirely (some S3-compatible servers reject canned ACLs).
 R2_PROVIDER="${R2_PROVIDER:-Cloudflare}"
-R2_ACL="${R2_ACL-private}"
+R2_ACL="${R2_ACL:-private}"
 
 # PUPTracker reporting (REQUIRED). The job fails fast (non-zero, no backup) in
 # validate_env() if either variable is missing — we never run a backup that
@@ -1180,6 +1180,16 @@ determine_backup_type() {
 
   if [[ "${STATE_PRESENT:-0}" -ne 1 || -z "$ST_LAST_FULL_NAME" ]]; then
     log "No valid successful full backup exists; forcing FULL backup."
+    DECIDED_TYPE="full"
+    return 0
+  fi
+
+  # A TRUE incremental requires a known-good file+position boundary from the
+  # last successful FULL (or the most recent successful incremental). If the
+  # persisted FULL has no usable anchor, establish a new safe FULL base rather
+  # than guessing where the incremental stream should begin.
+  if [[ "${BACKUP_BINLOG_ENABLED:-true}" == "true" ]] &&      [[ -z "${ST_LAST_BINLOG_FILE:-}" || -z "${ST_LAST_BINLOG_POSITION:-}" ]]; then
+    warn "Last successful FULL '${ST_LAST_FULL_NAME}' has no usable binlog anchor; forcing a new FULL to establish a safe incremental base."
     DECIDED_TYPE="full"
     return 0
   fi
