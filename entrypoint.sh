@@ -1628,7 +1628,7 @@ EOF
   # otherwise the option is omitted entirely so behaviour is byte-for-byte the
   # same as before on any server we cannot identify.
   local mydumper_sv=""
-  mydumper_sv="$(detect_mydumper_server_version || true)"
+  mydumper_sv=""
   local -a sv_args=()
   if [[ -n "$mydumper_sv" ]]; then
     sv_args=(--server-version "$mydumper_sv")
