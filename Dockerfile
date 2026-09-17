@@ -5,7 +5,7 @@ FROM rclone/rclone:1.74.3 as rclone
 # The published mydumper/mydumper image is built from mydumper/mydumper's
 # docker/Dockerfile which is `FROM almalinux:9` (RHEL-family). Its package
 # manager is dnf (yum); it has NO apt-get and NO apk.
-FROM mydumper/mydumper:v0.21.3-2
+FROM mydumper/mydumper:v0.21.4-1
 
 COPY --from=rclone /usr/local/bin/rclone /usr/local/bin/rclone
 
